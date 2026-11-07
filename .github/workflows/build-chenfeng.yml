@@ -11,7 +11,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y git patch flex bison byacc bzip2 cpio rsync curl wget \
-            ca-certificates tcsh unifdef cmake meson clang lld mtools build-essential \
+            ca-certificates tcsh unifdef cmake meson clang lld llvm mtools build-essential \
             gcc-multilib pkg-config ninja-build python3 python3-dev python3-pip \
             python3-venv python3-mako python3-yaml xz-utils libssl-dev zlib1g-dev \
             libbsd-dev uuid-dev llvm-dev libclang-dev device-tree-compiler bc jq \
@@ -28,7 +28,6 @@ jobs:
           restore-keys: |
             unixnu-linux-toolchain-v4
             unixnu-linux-toolchain-v3
-            unixnu-linux-toolchain-v2
 
       - name: Clone UniXNU-peridot & Mu-Silicium UEFI
         run: |
@@ -58,14 +57,41 @@ jobs:
           fi
           sudo chown -R runner:runner /opt/unixnu-linux
 
-      - name: Install clang-24, llvm-objcopy & __ptrauth Wrappers
+      - name: Install clang-24, llvm-objcopy, brew & __ptrauth Wrappers
         shell: python3 {0}
         run: |
-          import os, pathlib, shutil, subprocess, textwrap
+          import glob, os, pathlib, shutil, subprocess, textwrap
 
-          # 1. Wrap clang-24 to normalize iOS deployment target to 27.0
-          clang_path = pathlib.Path("/opt/unixnu-linux/llvm/bin/clang-24")
-          clang_real = pathlib.Path("/opt/unixnu-linux/llvm/bin/clang-24.real")
+          # 1. Install /usr/local/bin/brew shim so `brew --prefix llvm` returns /opt/unixnu-linux/llvm
+          brew_shim = textwrap.dedent('''\
+              #!/usr/bin/env python3
+              import sys
+              args = sys.argv[1:]
+              if "--prefix" in args:
+                  if "llvm" in args:
+                      print("/opt/unixnu-linux/llvm")
+                  else:
+                      print("/usr")
+                  sys.exit(0)
+              print("/usr")
+          ''')
+          tmp_brew = pathlib.Path("/tmp/brew-shim")
+          tmp_brew.write_text(brew_shim)
+          tmp_brew.chmod(0o755)
+          subprocess.run(["sudo", "cp", "-f", "/tmp/brew-shim", "/usr/local/bin/brew"], check=True)
+          subprocess.run(["sudo", "cp", "-f", "/tmp/brew-shim", "/usr/bin/brew"], check=True)
+
+          # 2. Symlink host llvm-* tools into /opt/unixnu-linux/llvm/bin if missing
+          llvm_bin = pathlib.Path("/opt/unixnu-linux/llvm/bin")
+          for tool in glob.glob("/usr/bin/llvm-*") + glob.glob("/usr/bin/lld*") + glob.glob("/usr/bin/ld.lld*"):
+              tname = os.path.basename(tool)
+              dest = llvm_bin / tname
+              if not dest.exists():
+                  os.symlink(tool, dest)
+
+          # 3. Wrap clang-24 to normalize iOS deployment target to 27.0
+          clang_path = llvm_bin / "clang-24"
+          clang_real = llvm_bin / "clang-24.real"
           if not clang_real.exists():
               shutil.move(str(clang_path), str(clang_real))
 
@@ -94,7 +120,7 @@ jobs:
           clang_path.write_text(clang_wrapper)
           clang_path.chmod(0o755)
 
-          # 2. Wrap /usr/bin/llvm-objcopy to support --globalize-symbol on Mach-O
+          # 4. Wrap llvm-objcopy to support --globalize-symbol, --localize-symbol, and --redefine-sym on Mach-O
           objcopy_wrapper = textwrap.dedent('''\
               #!/usr/bin/env python3
               import os, shutil, struct, subprocess, sys
@@ -102,6 +128,8 @@ jobs:
               real = "/usr/bin/llvm-objcopy.real"
               args = sys.argv[1:]
               globalize = []
+              localize = []
+              redefine = {}
               pass_args = []
               i = 0
               while i < len(args):
@@ -111,11 +139,23 @@ jobs:
                   elif a == "--globalize-symbol" and i + 1 < len(args):
                       globalize.append(args[i + 1])
                       i += 1
+                  elif a.startswith("--localize-symbol="):
+                      localize.append(a.split("=", 1)[1])
+                  elif a == "--localize-symbol" and i + 1 < len(args):
+                      localize.append(args[i + 1])
+                      i += 1
+                  elif a.startswith("--redefine-sym="):
+                      k, v = a.split("=", 1)[1].split("=", 1)
+                      redefine[k] = v
+                  elif a == "--redefine-sym" and i + 1 < len(args):
+                      k, v = args[i + 1].split("=", 1)
+                      redefine[k] = v
+                      i += 1
                   else:
                       pass_args.append(a)
                   i += 1
 
-              if not globalize:
+              if not globalize and not localize and not redefine:
                   os.execv(real, [real] + args)
 
               pos = [a for a in pass_args if not a.startswith("-")]
@@ -148,11 +188,17 @@ jobs:
 
                   if symtab_off is not None:
                       _, _, symoff, nsyms, stroff, strsize = struct.unpack_from("<6I", data, symtab_off)
-                      targets = set()
+                      g_targets = set()
                       for g in globalize:
-                          targets.add(g)
-                          targets.add("_" + g)
-                          targets.add(g.lstrip("_"))
+                          g_targets.update([g, "_" + g, g.lstrip("_")])
+                      l_targets = set()
+                      for l in localize:
+                          l_targets.update([l, "_" + l, l.lstrip("_")])
+                      r_map = {}
+                      for k, v in redefine.items():
+                          r_map[k] = v
+                          if not k.startswith("_") and not v.startswith("_"):
+                              r_map["_" + k] = "_" + v
 
                       syms = []
                       for idx in range(nsyms):
@@ -160,8 +206,19 @@ jobs:
                           n_strx, n_type, n_sect, n_desc, n_value = struct.unpack_from("<IBBHQ", data, s_pos)
                           end = data.find(0, stroff + n_strx)
                           name = data[stroff + n_strx : end].decode("utf-8", "ignore") if end != -1 else ""
-                          if name in targets or name.lstrip("_") in targets:
+                          if name in r_map:
+                              new_name = r_map[name]
+                              if stroff + strsize == len(data):
+                                  n_strx = strsize
+                                  enc = new_name.encode("utf-8") + b"\x00"
+                                  data.extend(enc)
+                                  strsize += len(enc)
+                                  struct.pack_into("<I", data, symtab_off + 20, strsize)
+                                  name = new_name
+                          if name in g_targets or name.lstrip("_") in g_targets:
                               n_type = (n_type | 0x01) & ~0x10
+                          if name in l_targets or name.lstrip("_") in l_targets:
+                              n_type = n_type & ~0x01
                           syms.append((idx, [n_strx, n_type, n_sect, n_desc, n_value], name))
 
                       if dysym_off is not None:
@@ -211,9 +268,11 @@ jobs:
               subprocess.run(["sudo", "cp", "-f", real_bin, "/usr/bin/llvm-objcopy.real"], check=True)
               subprocess.run(["sudo", "chmod", "+x", "/usr/bin/llvm-objcopy.real"], check=True)
           subprocess.run(["sudo", "cp", "-f", "/tmp/llvm-objcopy-wrapper", "/usr/bin/llvm-objcopy"], check=True)
-          subprocess.run(["sudo", "cp", "-f", "/tmp/llvm-objcopy-wrapper", "/opt/unixnu-linux/llvm/bin/llvm-objcopy"], check=True)
+          if (llvm_bin / "llvm-objcopy").is_symlink() or (llvm_bin / "llvm-objcopy").exists():
+              (llvm_bin / "llvm-objcopy").unlink()
+          subprocess.run(["sudo", "cp", "-f", "/tmp/llvm-objcopy-wrapper", str(llvm_bin / "llvm-objcopy")], check=True)
 
-          # 3. Patch TouchBoard.h, peridot.dts, and prepare-xnu-source.py
+          # 5. Patch TouchBoard.h, peridot.dts, and prepare-xnu-source.py
           repo = pathlib.Path("work/unixnu")
           tb = repo / "kits/peridot/TouchBoard.h"
           tb.write_text(tb.read_text().replace("#define TB_TOUCH_MAX_X   19520", "#define TB_TOUCH_MAX_X   19776").replace("#define TB_TOUCH_MAX_Y   43400", "#define TB_TOUCH_MAX_Y   44000"))
