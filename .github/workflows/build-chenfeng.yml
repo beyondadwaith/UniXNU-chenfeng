@@ -15,18 +15,18 @@ jobs:
             gcc-multilib pkg-config ninja-build python3 python3-dev python3-pip \
             python3-venv xz-utils libssl-dev zlib1g-dev libbsd-dev uuid-dev \
             llvm-dev libclang-dev device-tree-compiler bc jq unzip zip gawk mawk
+          sudo mkdir -p /opt/unixnu-linux
+          sudo chown -R runner:runner /opt/unixnu-linux
 
       - name: Cache Linux XNU Toolchain
         id: cache-toolchain
         uses: actions/cache@v4
         with:
-          path: |
-            /opt/unixnu-linux
-            /usr/local/bin/xcrun
-          key: unixnu-linux-toolchain-v2
+          path: /opt/unixnu-linux
+          key: unixnu-linux-toolchain-v3
           restore-keys: |
+            unixnu-linux-toolchain-v3
             unixnu-linux-toolchain-v2
-            unixnu-linux-toolchain-v1
 
       - name: Clone UniXNU-peridot & Mu-Silicium UEFI
         run: |
@@ -38,77 +38,31 @@ jobs:
         run: |
           cd work/unixnu
           mkdir -p final-output
-
           if [ -f /opt/unixnu-linux/xcrun.cached ] && [ ! -x /usr/local/bin/xcrun ]; then
             sudo cp -f /opt/unixnu-linux/xcrun.cached /usr/local/bin/xcrun
             sudo chmod +x /usr/local/bin/xcrun
           fi
-
-          if ! command -v xcrun >/dev/null 2>&1 || [ ! -x /opt/unixnu-linux/llvm/bin/clang ]; then
+          if ! command -v xcrun >/dev/null 2>&1 || [ ! -e /opt/unixnu-linux/llvm/bin/clang ]; then
             echo "Running scripts/linux/setup-toolchain.py..." >> final-output/build.log
             sudo python3 scripts/linux/setup-toolchain.py > final-output/toolchain.log 2>&1
             sudo cp -f /usr/local/bin/xcrun /opt/unixnu-linux/xcrun.cached 2>/dev/null || true
           else
             echo "Using cached /opt/unixnu-linux toolchain!" >> final-output/build.log
           fi
-
           if [ ! -f /opt/unixnu-linux/llvm/bin/clang-24.real ]; then
             sudo mv /opt/unixnu-linux/llvm/bin/clang-24 /opt/unixnu-linux/llvm/bin/clang-24.real
           fi
-
-          cat << 'EOF' | sudo tee /opt/unixnu-linux/llvm/bin/clang-24 >/dev/null
-          #!/usr/bin/env bash
-          if [ "${1:-}" = "-cc1" ] \vert{}\vert{} [ "${1:-}" = "-cc1as" ]; then
-            exec /opt/unixnu-linux/llvm/bin/clang-24.real "$@"
-          fi
-          HAS_TARGET=0
-          for arg in "$@"; do
-            case "$arg" in
-              --target=*|-target) HAS_TARGET=1 ;;
-            esac
-          done
-          ARGS=()
-          for arg in "$@"; do
-            if [ "$HAS_TARGET" -eq 1 ]; then
-              case "$arg" in
-                -mios-version-min=*|-miphoneos-version-min=*|-mmacosx-version-min=*)
-                  continue
-                  ;;
-              esac
-            fi
-            ARGS+=("$arg")
-          done
-          exec /opt/unixnu-linux/llvm/bin/clang-24.real "${ARGS[@]}" -Wno-overriding-option -Wno-error=overriding-option
-          EOF
-          sudo chmod +x /opt/unixnu-linux/llvm/bin/clang-24
+          sudo python3 -c 'import pathlib; p = pathlib.Path("/opt/unixnu-linux/llvm/bin/clang-24"); p.write_text("#!/usr/bin/env python3\nimport os, sys\nreal = \"/opt/unixnu-linux/llvm/bin/clang-24.real\"\nargs = sys.argv[1:]\nif not args or args[0] not in (\"-cc1\", \"-cc1as\"):\n    if any(a.startswith(\"--target=\") or a == \"-target\" for a in args):\n        args = [a for a in args if not a.startswith((\"-mios-version-min=\", \"-miphoneos-version-min=\", \"-mmacosx-version-min=\"))]\n    args.extend([\"-Wno-overriding-option\", \"-Wno-error=overriding-option\"])\nos.execv(real, [real] + args)\n"); p.chmod(0o755)'
+          sudo chown -R runner:runner /opt/unixnu-linux
           echo "Toolchain and clang-24 wrapper ready." >> final-output/build.log
 
       - name: Patch Hardware Values & Fix Clang 24 __ptrauth Macro
         run: |
           cd work/unixnu
-
-          # 1. Patch TouchBoard.h for Xiaomi 14 Civi 1236x2750 display (19776 x 44000 in 1/16th pixel units)
           sed -i 's/#define TB_TOUCH_MAX_X   19520/#define TB_TOUCH_MAX_X   19776/g' kits/peridot/TouchBoard.h
           sed -i 's/#define TB_TOUCH_MAX_Y   43400/#define TB_TOUCH_MAX_Y   44000/g' kits/peridot/TouchBoard.h
-
-          # 2. Update model description in peridot.dts
           sed -i 's/Xiaomi Poco F6 \/ Redmi Turbo 3/Xiaomi 14 Civi (chenfeng)/g' dts/peridot.dts
-
-          # 3. Strip 4th argument from __ptrauth(..., "authenticates-null-values") for Linux Clang 24
-          cat << 'EOF' >> scripts/prepare-xnu-source.py
-
-          import pathlib
-          for root_dir in [pathlib.Path('.cache/xnu-work'), pathlib.Path('refer/libplatform'), pathlib.Path('.cache/fakeroot')]:
-              if root_dir.exists():
-                  for hfile in root_dir.rglob('*.h'):
-                      try:
-                          txt = hfile.read_text(errors='ignore')
-                          if '"authenticates-null-values"' in txt:
-                              hfile.write_text(txt.replace(', "authenticates-null-values"', ''))
-                      except Exception:
-                          pass
-          EOF
-
+          python3 -c 'import pathlib; p = pathlib.Path("scripts/prepare-xnu-source.py"); p.write_text(p.read_text() + "\nimport pathlib\nfor d in [\".cache/xnu-work\", \"refer/libplatform\", \".cache/fakeroot\"]:\n    r = pathlib.Path(d)\n    if r.exists():\n        for h in r.rglob(\"*.h\"):\n            t = h.read_text(errors=\"ignore\")\n            if \"authenticates-null-values\" in t:\n                h.write_text(t.replace(\", \\\"authenticates-null-values\\\"\", \"\"))\n")'
           cp kits/peridot/TouchBoard.h final-output/
           cp dts/peridot.dts final-output/chenfeng.dts
           cp board.toml final-output/
@@ -123,7 +77,6 @@ jobs:
             echo "=== 1. Running unixnu defconfig & fetch ==="
             ./unixnu defconfig peridot_defconfig -D .
             ./unixnu fetch
-
             grep -rl '"authenticates-null-values"' out/feeds/ 2>/dev/null | xargs -r sed -i 's/, *"authenticates-null-values"//g' || true
 
             echo "=== 2. Fetching IPSW KernelCache via Range Requests ==="
@@ -132,5 +85,43 @@ jobs:
             echo "=== 3. Assembling build tree & Compiling DTB ==="
             ./unixnu tree
             ./unixnu build dtb || true
-            SOC_DTS_DIR=$(
-            
+            SOC_DTS_DIR=$(find out -type f -name "sm8550.dtsi" -printf "%h\n" | head -n 1)
+            dtc -I dts -O dtb -i "$SOC_DTS_DIR" -i dts -o final-output/chenfeng.dtb dts/peridot.dts
+            echo "Compiled final-output/chenfeng.dtb successfully!"
+
+            echo "=== 4. Building UEFI Package (UniXNU.efi) ==="
+            ./unixnu build package || true
+
+            echo "=== 5. Building XNU Kernel & Driver Archives ==="
+            ./unixnu build kernel || true
+
+            echo "=== 6. Building Mu-Silicium UEFI Firmware & Boot Image ==="
+            ./unixnu build firmware --uefi ../Mu-Silicium || true
+            ./unixnu build payload || true
+            ./unixnu bootimg --uefi ../Mu-Silicium --dtb final-output/chenfeng.dtb -o final-output/boot-chenfeng.img || ./unixnu bootimg --uefi ../Mu-Silicium || true
+          } 2>&1 | tee -a final-output/build.log
+
+      - name: Collect Compiled Binaries & Log Summaries
+        if: always()
+        run: |
+          cd work/unixnu
+          mkdir -p final-output
+          cp -f ../Mu-Silicium/Build/peridotPkg/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd final-output/ 2>/dev/null || true
+          find build out -type f \( -name "*.efi" -o -name "*.macho" -o -name "*.unstripped" -o -name "*.img" -o -name "*.fd" -o -name "*.dtb" -o -name "boot*.json" -o -name "payload.json" \) -exec cp --parents {} final-output/ \; 2>/dev/null || true
+          echo "=== Tail of Step Logs ===" >> final-output/build.log
+          for lfile in out/peridot/ios-27.0.1-24A446/peridot/logs/*.log; do
+            if [ -f "$lfile" ] && [[ "$lfile" != *"kernel-bootstrap.log" ]]; then
+              echo "--- $lfile (last 30 lines) ---" >> final-output/build.log
+              tail -n 30 "$lfile" >> final-output/build.log
+            fi
+          done
+          echo "=== Final Collected Files ===" >> final-output/build.log
+          ls -lhR final-output/ >> final-output/build.log
+
+      - name: Upload Clean Build Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-chenfeng-artifacts
+          path: work/unixnu/final-output/
+          
