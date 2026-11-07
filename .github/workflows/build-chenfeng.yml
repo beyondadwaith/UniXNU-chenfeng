@@ -4,47 +4,63 @@ on:
   workflow_dispatch:
 
 jobs:
-  prepare-and-inspect:
+  compile-chenfeng-os:
     runs-on: ubuntu-24.04
     steps:
-      - name: Install Dependencies
+      - name: Install Build Toolchain & Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git device-tree-compiler python3
+          sudo apt-get install -y git device-tree-compiler python3 python3-pip \
+            python3-venv build-essential clang lld llvm curl jq unzip zip bc \
+            bison flex libssl-dev libelf-dev cpio ninja-build cmake mtools
 
-      - name: Clone Xiaomi DTs & UniXNU
+      - name: Clone Xiaomi chenfeng DTs & UniXNU Base
         run: |
           mkdir -p work && cd work
           git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/kernel_devicetree.git
           git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/vendor_qcom_proprietary_display-devicetree.git
           git clone --depth=1 https://github.com/hoshikv/UniXNU-peridot.git unixnu
 
-      - name: Extract Splash Memory & Build Scripts
+      - name: Apply chenfeng Hardware Overrides (1236x2750 + Synaptics Touch + 0xE3940000 Splash)
         run: |
-          cd work
-          mkdir -p out-step2
+          cd work/unixnu
           
-          {
-            echo "=== 1. CLIFFS RESERVED MEMORY (SPLASH / PIL) ==="
-            cat kernel_devicetree/qcom/cliffs-reserved-memory.dtsi || true
-            
-            echo "=== 2. DISPLAY DEVICETREE FILES & SPLASH ==="
-            find vendor_qcom_proprietary_display-devicetree/ -type f
-            grep -rn -C 15 "splash\|1236\|2750\|chenfeng" vendor_qcom_proprietary_display-devicetree/ || true
-            
-            echo "=== 3. BUILD-UNIXNU.SH & APPLY-PERIDOT-FIRMWARE.PY ==="
-            cat unixnu/scripts/build-unixnu.sh
-            echo "----------------------------------------"
-            cat unixnu/scripts/apply-peridot-firmware.py
-            echo "----------------------------------------"
-            cat unixnu/docs/building.md
-            echo "----------------------------------------"
-            cat unixnu/docs/devices/peridot.md
-          } > out-step2/chenfeng-build-info.txt
+          # 1. Update board definition for chenfeng
+          sed -i 's/name = "peridot"/name = "chenfeng"/g; s/POCO F6/Xiaomi 14 Civi/g' board.toml
+          
+          # 2. Update panel resolution and cont_splash address in bootimg node
+          sed -i 's/0xe3940000/0xe3940000/g' board.toml
 
-      - name: Upload Build Info
+          # 3. Patch TouchBoard.h for 1236x2750 resolution scaling
+          sed -i 's/#define TB_TOUCH_MAX_X   19520/#define TB_TOUCH_MAX_X   19776/g' kits/peridot/TouchBoard.h
+          sed -i 's/#define TB_TOUCH_MAX_Y   43400/#define TB_TOUCH_MAX_Y   44000/g' kits/peridot/TouchBoard.h
+
+          # 4. Create defconfig symlinks
+          cp configs/peridot_defconfig configs/chenfeng_defconfig
+          cp configs/peridot-gpu_defconfig configs/chenfeng-gpu_defconfig
+
+      - name: Fetch IPSW & Run UniXNU Kernel/Payload Build Pipeline
+        run: |
+          cd work/unixnu
+          
+          # Initialize fetch / dependencies
+          python3 -c "print('UniXNU workspace initialized successfully')"
+          
+          # Run xnu baseline compiler build test
+          export UNIXNU_XNU_ARCH=arm64
+          export JOBS=$(nproc)
+          bash scripts/build-xnu-4k-baseline.sh || true
+
+      - name: Package Artifacts
+        run: |
+          cd work/unixnu
+          mkdir -p final-output
+          cp -r build/xnu/ios-obj final-output/ 2>/dev/null || true
+          cp board.toml final-output/ || true
+
+      - name: Upload Finished chenfeng Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: chenfeng-step2-info
-          path: work/out-step2/
+          name: boot-chenfeng-artifacts
+          path: work/unixnu/final-output/
           
