@@ -2,79 +2,49 @@ name: Build Xiaomi 14 Civi (chenfeng) iOS Port
 
 on:
   workflow_dispatch:
-    inputs:
-      build_stage:
-        description: 'Select Stage: "1-generate-chenfeng-tree" (fast, ~1 min) or "2-compile-kernel" (~25 mins)'
-        required: true
-        default: '1-generate-chenfeng-tree'
 
 jobs:
-  build-chenfeng:
+  prepare-and-inspect:
     runs-on: ubuntu-24.04
     steps:
-      - name: Install Toolchain & Dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git device-tree-compiler python3 python3-pip \
-            python3-venv build-essential clang lld llvm curl jq unzip zip bc \
-            bison flex libssl-dev libelf-dev cpio ninja-build cmake
+          sudo apt-get install -y git device-tree-compiler python3
 
-      - name: Clone Xiaomi chenfeng-u-oss DTs & UniXNU Base
+      - name: Clone Xiaomi DTs & UniXNU
         run: |
           mkdir -p work && cd work
           git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/kernel_devicetree.git
           git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/vendor_qcom_proprietary_display-devicetree.git
           git clone --depth=1 https://github.com/hoshikv/UniXNU-peridot.git unixnu
 
-      - name: Auto-Port SM8635 (peridot -> chenfeng) & Dump Plaintext Configs
+      - name: Extract Splash Memory & Build Scripts
         run: |
           cd work
-          mkdir -p out-plain
+          mkdir -p out-step2
           
-          # 1. Dump readable reference files from peridot so we can see exact structure
-          cp unixnu/dts/peridot.dts out-plain/peridot.dts
-          cp unixnu/board.toml out-plain/board.toml
-          cp unixnu/components.toml out-plain/components.toml
-          cp unixnu/devices.toml out-plain/devices.toml
-          cp unixnu/configs/peridot_defconfig out-plain/peridot_defconfig
-          cp unixnu/configs/peridot-gpu_defconfig out-plain/peridot-gpu_defconfig
-          cp unixnu/kits/peridot/TouchBoard.h out-plain/TouchBoard.h
-          cp unixnu/scripts/build-unixnu.sh out-plain/build-unixnu.sh
-          cp unixnu/scripts/build-xnu-4k-baseline.sh out-plain/build-xnu-4k-baseline.sh
-
-          # 2. Extract exact Xiaomi 14 Civi (chenfeng / cliffs) hardware nodes into a single readable file
           {
-            echo "=== CHENFENG BOARD & MEMORY DTSI ==="
-            find kernel_devicetree/ -name "*chenfeng*.dts*" -exec head -n 300 {} +
-            echo "=== CLIFFS RESERVED MEMORY & CONT_SPLASH ==="
-            grep -rn -C 20 "cont_splash\|pil_\|reserved-memory\|ufshc@\|pcie@" kernel_devicetree/qcom/cliffs*.dtsi || true
-            echo "=== CHENFENG DISPLAY PANEL RESOLUTION & FRAMEBUFFER ==="
-            find vendor_qcom_proprietary_display-devicetree/ -name "*chenfeng*.dts*" -exec grep -H -C 15 "panel-width\|panel-height\|framebuffer\|cont_splash" {} + || true
-            echo "=== CHENFENG TOUCHSCREEN SPI/I2C & GPIO ==="
-            grep -rn -C 25 "goodix\|focaltech\|xiaomi,touch\|fts" kernel_devicetree/qcom/*chenfeng* || true
-          } > out-plain/chenfeng-extracted-specs.txt
+            echo "=== 1. CLIFFS RESERVED MEMORY (SPLASH / PIL) ==="
+            cat kernel_devicetree/qcom/cliffs-reserved-memory.dtsi || true
+            
+            echo "=== 2. DISPLAY DEVICETREE FILES & SPLASH ==="
+            find vendor_qcom_proprietary_display-devicetree/ -type f
+            grep -rn -C 15 "splash\|1236\|2750\|chenfeng" vendor_qcom_proprietary_display-devicetree/ || true
+            
+            echo "=== 3. BUILD-UNIXNU.SH & APPLY-PERIDOT-FIRMWARE.PY ==="
+            cat unixnu/scripts/build-unixnu.sh
+            echo "----------------------------------------"
+            cat unixnu/scripts/apply-peridot-firmware.py
+            echo "----------------------------------------"
+            cat unixnu/docs/building.md
+            echo "----------------------------------------"
+            cat unixnu/docs/devices/peridot.md
+          } > out-step2/chenfeng-build-info.txt
 
-          # 3. Create chenfeng device entries inside unixnu tree
-          cp unixnu/dts/peridot.dts unixnu/dts/chenfeng.dts
-          sed -i 's/peridot/chenfeng/g; s/Peridot/Chenfeng/g; s/POCO F6/Xiaomi 14 Civi/g' unixnu/dts/chenfeng.dts
-          cp unixnu/configs/peridot_defconfig unixnu/configs/chenfeng_defconfig
-          cp unixnu/configs/peridot-gpu_defconfig unixnu/configs/chenfeng-gpu_defconfig
-          cp unixnu/dts/chenfeng.dts out-plain/chenfeng.dts
-
-          # 4. Compile chenfeng.dts -> chenfeng.dtb to verify valid Device Tree syntax
-          dtc -I dts -O dtb -o out-plain/chenfeng.dtb unixnu/dts/chenfeng.dts || true
-
-      - name: Compile UEFI Package & XNU (If Stage 2 Selected)
-        if: ${{ github.event.inputs.build_stage == '2-compile-kernel' }}
-        run: |
-          cd work/unixnu
-          chmod +x package/build.sh scripts/*.sh
-          ./package/build.sh || true
-          cp -r build/* ../out-plain/ 2>/dev/null || true
-
-      - name: Upload Plaintext Files & Compiled DTB
+      - name: Upload Build Info
         uses: actions/upload-artifact@v4
         with:
-          name: chenfeng-plain-files
-          path: work/out-plain/
+          name: chenfeng-step2-info
+          path: work/out-step2/
           
