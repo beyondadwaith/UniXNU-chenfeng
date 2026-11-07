@@ -1,61 +1,80 @@
-name: Auto-Extract & Build Xiaomi 14 Civi (chenfeng) iOS Port
+name: Build Xiaomi 14 Civi (chenfeng) iOS Port
 
 on:
   workflow_dispatch:
     inputs:
-      ipsw_url:
-        description: 'Direct Apple IPSW URL (Optional - leave blank to run hardware extraction + ADT/UEFI config generation first)'
-        required: false
-        default: ''
+      build_stage:
+        description: 'Select Stage: "1-generate-chenfeng-tree" (fast, ~1 min) or "2-compile-kernel" (~25 mins)'
+        required: true
+        default: '1-generate-chenfeng-tree'
 
 jobs:
-  extract-and-prepare-chenfeng:
+  build-chenfeng:
     runs-on: ubuntu-24.04
     steps:
-      - name: Install Device Tree & Build Dependencies
+      - name: Install Toolchain & Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y git device-tree-compiler python3 python3-pip \
             python3-venv build-essential clang lld llvm curl jq unzip zip bc \
-            bison flex libssl-dev libelf-dev cpio
+            bison flex libssl-dev libelf-dev cpio ninja-build cmake
 
-      - name: Clone Official Xiaomi 14 Civi (chenfeng-u-oss) Device Trees
+      - name: Clone Xiaomi chenfeng-u-oss DTs & UniXNU Base
         run: |
           mkdir -p work && cd work
-          echo "Cloning MiCode kernel_devicetree (chenfeng-u-oss)..."
           git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/kernel_devicetree.git
-          echo "Cloning MiCode display-devicetree (chenfeng-u-oss)..."
           git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/vendor_qcom_proprietary_display-devicetree.git
+          git clone --depth=1 https://github.com/hoshikv/UniXNU-peridot.git unixnu
 
-      - name: Clone SM8635 Sibling Base (UniXNU-peridot)
+      - name: Auto-Port SM8635 (peridot -> chenfeng) & Dump Plaintext Configs
         run: |
           cd work
-          git clone --depth=1 https://github.com/hoshikv/UniXNU-peridot.git || \
-          git clone --depth=1 https://github.com/wzy114514sb/UniXNU-peridot.git UniXNU-peridot
+          mkdir -p out-plain
+          
+          # 1. Dump readable reference files from peridot so we can see exact structure
+          cp unixnu/dts/peridot.dts out-plain/peridot.dts
+          cp unixnu/board.toml out-plain/board.toml
+          cp unixnu/components.toml out-plain/components.toml
+          cp unixnu/devices.toml out-plain/devices.toml
+          cp unixnu/configs/peridot_defconfig out-plain/peridot_defconfig
+          cp unixnu/configs/peridot-gpu_defconfig out-plain/peridot-gpu_defconfig
+          cp unixnu/kits/peridot/TouchBoard.h out-plain/TouchBoard.h
+          cp unixnu/scripts/build-unixnu.sh out-plain/build-unixnu.sh
+          cp unixnu/scripts/build-xnu-4k-baseline.sh out-plain/build-xnu-4k-baseline.sh
 
-      - name: Extract chenfeng Hardware Map & Generate Port Configs
+          # 2. Extract exact Xiaomi 14 Civi (chenfeng / cliffs) hardware nodes into a single readable file
+          {
+            echo "=== CHENFENG BOARD & MEMORY DTSI ==="
+            find kernel_devicetree/ -name "*chenfeng*.dts*" -exec head -n 300 {} +
+            echo "=== CLIFFS RESERVED MEMORY & CONT_SPLASH ==="
+            grep -rn -C 20 "cont_splash\|pil_\|reserved-memory\|ufshc@\|pcie@" kernel_devicetree/qcom/cliffs*.dtsi || true
+            echo "=== CHENFENG DISPLAY PANEL RESOLUTION & FRAMEBUFFER ==="
+            find vendor_qcom_proprietary_display-devicetree/ -name "*chenfeng*.dts*" -exec grep -H -C 15 "panel-width\|panel-height\|framebuffer\|cont_splash" {} + || true
+            echo "=== CHENFENG TOUCHSCREEN SPI/I2C & GPIO ==="
+            grep -rn -C 25 "goodix\|focaltech\|xiaomi,touch\|fts" kernel_devicetree/qcom/*chenfeng* || true
+          } > out-plain/chenfeng-extracted-specs.txt
+
+          # 3. Create chenfeng device entries inside unixnu tree
+          cp unixnu/dts/peridot.dts unixnu/dts/chenfeng.dts
+          sed -i 's/peridot/chenfeng/g; s/Peridot/Chenfeng/g; s/POCO F6/Xiaomi 14 Civi/g' unixnu/dts/chenfeng.dts
+          cp unixnu/configs/peridot_defconfig unixnu/configs/chenfeng_defconfig
+          cp unixnu/configs/peridot-gpu_defconfig unixnu/configs/chenfeng-gpu_defconfig
+          cp unixnu/dts/chenfeng.dts out-plain/chenfeng.dts
+
+          # 4. Compile chenfeng.dts -> chenfeng.dtb to verify valid Device Tree syntax
+          dtc -I dts -O dtb -o out-plain/chenfeng.dtb unixnu/dts/chenfeng.dts || true
+
+      - name: Compile UEFI Package & XNU (If Stage 2 Selected)
+        if: ${{ github.event.inputs.build_stage == '2-compile-kernel' }}
         run: |
-          cd work
-          mkdir -p chenfeng-extracted
-          
-          echo "=== 1. Searching chenfeng/cliffs Memory Map & Reserved Carveouts ===" | tee chenfeng-extracted/hardware-report.txt
-          grep -rn -C 15 "reserved-memory\|cont_splash\|pil_\|mpss\|adsp\|cdsp" kernel_devicetree/ vendor_qcom_proprietary_display-devicetree/ >> chenfeng-extracted/hardware-report.txt || true
-          
-          echo "=== 2. Searching chenfeng Display Panel & Framebuffer ===" | tee -a chenfeng-extracted/hardware-report.txt
-          find vendor_qcom_proprietary_display-devicetree/ -name "*chenfeng*" -o -name "*cliffs*" | tee -a chenfeng-extracted/hardware-report.txt
-          grep -rn -C 10 "qcom,mdss-dsi-panel-width\|qcom,mdss-dsi-panel-height\|cont_splash" vendor_qcom_proprietary_display-devicetree/ >> chenfeng-extracted/hardware-report.txt || true
+          cd work/unixnu
+          chmod +x package/build.sh scripts/*.sh
+          ./package/build.sh || true
+          cp -r build/* ../out-plain/ 2>/dev/null || true
 
-          echo "=== 3. Searching Touchscreen (Goodix / Focaltech / Xiaomi Touch) ===" | tee -a chenfeng-extracted/hardware-report.txt
-          grep -rn -i -C 12 "focaltech\|goodix\|xiaomi,touch\|fts_ts" kernel_devicetree/ >> chenfeng-extracted/hardware-report.txt || true
-
-          echo "=== 4. Copying all chenfeng & cliffs DTSI files ==="
-          find kernel_devicetree/ -name "*chenfeng*" -o -name "*cliffs*" | xargs -I {} cp --parents {} chenfeng-extracted/
-          find vendor_qcom_proprietary_display-devicetree/ -name "*chenfeng*" -o -name "*cliffs*" | xargs -I {} cp --parents {} chenfeng-extracted/
-          
-          cp -r UniXNU-peridot chenfeng-extracted/UniXNU-peridot-reference
-
-      - name: Upload Extracted chenfeng Descriptors & Reference Tree
+      - name: Upload Plaintext Files & Compiled DTB
         uses: actions/upload-artifact@v4
         with:
-          name: chenfeng-hardware-and-port-files
-          path: work/chenfeng-extracted/
+          name: chenfeng-plain-files
+          path: work/out-plain/
+          
