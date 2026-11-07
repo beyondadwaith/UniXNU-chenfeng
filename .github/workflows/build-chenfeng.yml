@@ -59,9 +59,9 @@ jobs:
           sudo chown -R runner:runner /opt/unixnu-linux
 
       - name: Install clang-24, llvm-objcopy & __ptrauth Wrappers
-        shell: python3
+        shell: python3 {0}
         run: |
-          import pathlib, shutil, subprocess
+          import os, pathlib, shutil, subprocess, textwrap
 
           # 1. Wrap clang-24 to normalize iOS deployment target to 27.0
           clang_path = pathlib.Path("/opt/unixnu-linux/llvm/bin/clang-24")
@@ -69,144 +69,147 @@ jobs:
           if not clang_real.exists():
               shutil.move(str(clang_path), str(clang_real))
 
-          clang_wrapper = '''#!/usr/bin/env python3
-          import os, re, sys
-          real = "/opt/unixnu-linux/llvm/bin/clang-24.real"
-          args = sys.argv[1:]
-          if not args or args[0] not in ("-cc1", "-cc1as"):
-              ver = "27.0"
-              for a in args:
-                  if a.startswith(("-mios-version-min=", "-miphoneos-version-min=")):
-                      ver = a.split("=", 1)[1]
-              if any("apple-ios" in a for a in args):
-                  new_args = []
+          clang_wrapper = textwrap.dedent('''\
+              #!/usr/bin/env python3
+              import os, re, sys
+              real = "/opt/unixnu-linux/llvm/bin/clang-24.real"
+              args = sys.argv[1:]
+              if not args or args[0] not in ("-cc1", "-cc1as"):
+                  ver = "27.0"
                   for a in args:
                       if a.startswith(("-mios-version-min=", "-miphoneos-version-min=")):
-                          continue
-                      if "apple-ios" in a:
-                          a = re.sub(r"(apple-ios)[0-9.]+", rf"\\g<1>{ver}", a)
-                      new_args.append(a)
-                  args = new_args
-              args.extend(["-Wno-overriding-option", "-Wno-error=overriding-option"])
-          os.execv(real, [real] + args)
-          '''
-          clang_path.write_text("\n".join(line.strip() if i == 0 else line[10:] for i, line in enumerate(clang_wrapper.strip().splitlines())) + "\n")
+                          ver = a.split("=", 1)[1]
+                  if any("apple-ios" in a for a in args):
+                      new_args = []
+                      for a in args:
+                          if a.startswith(("-mios-version-min=", "-miphoneos-version-min=")):
+                              continue
+                          if "apple-ios" in a:
+                              a = re.sub(r"(apple-ios)[0-9.]+", rf"\\g<1>{ver}", a)
+                          new_args.append(a)
+                      args = new_args
+                  args.extend(["-Wno-overriding-option", "-Wno-error=overriding-option"])
+              os.execv(real, [real] + args)
+          ''')
+          clang_path.write_text(clang_wrapper)
           clang_path.chmod(0o755)
 
           # 2. Wrap /usr/bin/llvm-objcopy to support --globalize-symbol on Mach-O
-          objcopy_Script = '''#!/usr/bin/env python3
-          import os, shutil, struct, subprocess, sys
+          objcopy_wrapper = textwrap.dedent('''\
+              #!/usr/bin/env python3
+              import os, shutil, struct, subprocess, sys
 
-          real = "/usr/bin/llvm-objcopy.real"
-          args = sys.argv[1:]
-          globalize = []
-          pass_args = []
-          i = 0
-          while i < len(args):
-              a = args[i]
-              if a.startswith("--globalize-symbol="):
-                  globalize.append(a.split("=", 1)[1])
-              elif a == "--globalize-symbol" and i + 1 < len(args):
-                  globalize.append(args[i + 1])
-                  i += 1
-              else:
-                  pass_args.append(a)
-              i += 1
-
-          if not globalize:
-              os.execv(real, [real] + args)
-
-          pos = [a for a in pass_args if not a.startswith("-")]
-          opt = [a for a in pass_args if a.startswith("-")]
-          in_file = pos[0]
-          out_file = pos[1] if len(pos) > 1 else in_file
-
-          if opt:
-              res = subprocess.run([real] + pass_args)
-              if res.returncode != 0:
-                  sys.exit(res.returncode)
-          elif in_file != out_file:
-              shutil.copyfile(in_file, out_file)
-
-          data = bytearray(open(out_file, "rb").read())
-          if len(data) >= 32 and struct.unpack_from("<I", data, 0)[0] == 0xFEEDFACF:
-              ncmds = struct.unpack_from("<I", data, 16)[0]
-              off = 32
-              symtab_off = dysym_off = None
-              segs = []
-              for _ in range(ncmds):
-                  cmd, cmdsize = struct.unpack_from("<II", data, off)
-                  if cmd == 0x2:
-                      symtab_off = off
-                  elif cmd == 0xB:
-                      dysym_off = off
-                  elif cmd == 0x19:
-                      segs.append(off)
-                  off += cmdsize
-
-              if symtab_off is not None:
-                  _, _, symoff, nsyms, stroff, strsize = struct.unpack_from("<6I", data, symtab_off)
-                  targets = set()
-                  for g in globalize:
-                      targets.add(g)
-                      targets.add("_" + g)
-                      targets.add(g.lstrip("_"))
-
-                  syms = []
-                  for idx in range(nsyms):
-                      s_pos = symoff + idx * 16
-                      n_strx, n_type, n_sect, n_desc, n_value = struct.unpack_from("<IBBHQ", data, s_pos)
-                      end = data.find(0, stroff + n_strx)
-                      name = data[stroff + n_strx : end].decode("utf-8", "ignore") if end != -1 else ""
-                      if name in targets or name.lstrip("_") in targets:
-                          n_type = (n_type | 0x01) & ~0x10
-                      syms.append((idx, [n_strx, n_type, n_sect, n_desc, n_value], name))
-
-                  if dysym_off is not None:
-                      loc = [s for s in syms if (s[1][1] & 0x01) == 0]
-                      ext = [s for s in syms if (s[1][1] & 0x01) != 0 and (s[1][1] & 0x0E) != 0]
-                      und = [s for s in syms if (s[1][1] & 0x01) != 0 and (s[1][1] & 0x0E) == 0]
-                      ext.sort(key=lambda x: x[2])
-                      new_syms = loc + ext + und
-                      old_to_new = {orig_i: new_i for new_i, (orig_i, _, _) in enumerate(new_syms)}
-
-                      for new_i, (_, fields, _) in enumerate(new_syms):
-                          struct.pack_into("<IBBHQ", data, symoff + new_i * 16, *fields)
-
-                      struct.pack_into("<6I", data, dysym_off + 8, 0, len(loc), len(loc), len(ext), len(loc) + len(ext), len(und))
-
-                      for seg_off in segs:
-                          nsects = struct.unpack_from("<I", data, seg_off + 64)[0]
-                          for s_i in range(nsects):
-                              sect_off = seg_off + 72 + s_i * 80
-                              reloff, nreloc = struct.unpack_from("<II", data, sect_off + 56)
-                              for r_i in range(nreloc):
-                                  r_pos = reloff + r_i * 8
-                                  r_info = struct.unpack_from("<I", data, r_pos + 4)[0]
-                                  if (r_info >> 27) & 1:
-                                      snum = r_info & 0x00FFFFFF
-                                      if snum in old_to_new:
-                                          r_info = (r_info & 0xFF000000) | (old_to_new[snum] & 0x00FFFFFF)
-                                          struct.pack_into("<I", data, r_pos + 4, r_info)
-
-                      indsymoff, nindsyms = struct.unpack_from("<II", data, dysym_off + 56)
-                      for k in range(nindsyms):
-                          ipos = indsymoff + k * 4
-                          val = struct.unpack_from("<I", data, ipos)[0]
-                          if (val & 0xC0000000) == 0 and val in old_to_new:
-                              struct.pack_into("<I", data, ipos, old_to_new[val])
+              real = "/usr/bin/llvm-objcopy.real"
+              args = sys.argv[1:]
+              globalize = []
+              pass_args = []
+              i = 0
+              while i < len(args):
+                  a = args[i]
+                  if a.startswith("--globalize-symbol="):
+                      globalize.append(a.split("=", 1)[1])
+                  elif a == "--globalize-symbol" and i + 1 < len(args):
+                      globalize.append(args[i + 1])
+                      i += 1
                   else:
-                      for idx, (_, fields, _) in enumerate(syms):
-                          struct.pack_into("<IBBHQ", data, symoff + idx * 16, *fields)
+                      pass_args.append(a)
+                  i += 1
 
-              open(out_file, "wb").write(data)
-          '''
-          objcopy_clean = "\n".join(line.strip() if i == 0 else line[10:] for i, line in enumerate(objcopy_Script.strip().splitlines())) + "\n"
+              if not globalize:
+                  os.execv(real, [real] + args)
+
+              pos = [a for a in pass_args if not a.startswith("-")]
+              opt = [a for a in pass_args if a.startswith("-")]
+              in_file = pos[0]
+              out_file = pos[1] if len(pos) > 1 else in_file
+
+              if opt:
+                  res = subprocess.run([real] + pass_args)
+                  if res.returncode != 0:
+                      sys.exit(res.returncode)
+              elif in_file != out_file:
+                  shutil.copyfile(in_file, out_file)
+
+              data = bytearray(open(out_file, "rb").read())
+              if len(data) >= 32 and struct.unpack_from("<I", data, 0)[0] == 0xFEEDFACF:
+                  ncmds = struct.unpack_from("<I", data, 16)[0]
+                  off = 32
+                  symtab_off = dysym_off = None
+                  segs = []
+                  for _ in range(ncmds):
+                      cmd, cmdsize = struct.unpack_from("<II", data, off)
+                      if cmd == 0x2:
+                          symtab_off = off
+                      elif cmd == 0xB:
+                          dysym_off = off
+                      elif cmd == 0x19:
+                          segs.append(off)
+                      off += cmdsize
+
+                  if symtab_off is not None:
+                      _, _, symoff, nsyms, stroff, strsize = struct.unpack_from("<6I", data, symtab_off)
+                      targets = set()
+                      for g in globalize:
+                          targets.add(g)
+                          targets.add("_" + g)
+                          targets.add(g.lstrip("_"))
+
+                      syms = []
+                      for idx in range(nsyms):
+                          s_pos = symoff + idx * 16
+                          n_strx, n_type, n_sect, n_desc, n_value = struct.unpack_from("<IBBHQ", data, s_pos)
+                          end = data.find(0, stroff + n_strx)
+                          name = data[stroff + n_strx : end].decode("utf-8", "ignore") if end != -1 else ""
+                          if name in targets or name.lstrip("_") in targets:
+                              n_type = (n_type | 0x01) & ~0x10
+                          syms.append((idx, [n_strx, n_type, n_sect, n_desc, n_value], name))
+
+                      if dysym_off is not None:
+                          loc = [s for s in syms if (s[1][1] & 0x01) == 0]
+                          ext = [s for s in syms if (s[1][1] & 0x01) != 0 and (s[1][1] & 0x0E) != 0]
+                          und = [s for s in syms if (s[1][1] & 0x01) != 0 and (s[1][1] & 0x0E) == 0]
+                          ext.sort(key=lambda x: x[2])
+                          new_syms = loc + ext + und
+                          old_to_new = {orig_i: new_i for new_i, (orig_i, _, _) in enumerate(new_syms)}
+
+                          for new_i, (_, fields, _) in enumerate(new_syms):
+                              struct.pack_into("<IBBHQ", data, symoff + new_i * 16, *fields)
+
+                          struct.pack_into("<6I", data, dysym_off + 8, 0, len(loc), len(loc), len(ext), len(loc) + len(ext), len(und))
+
+                          for seg_off in segs:
+                              nsects = struct.unpack_from("<I", data, seg_off + 64)[0]
+                              for s_i in range(nsects):
+                                  sect_off = seg_off + 72 + s_i * 80
+                                  reloff, nreloc = struct.unpack_from("<II", data, sect_off + 56)
+                                  for r_i in range(nreloc):
+                                      r_pos = reloff + r_i * 8
+                                      r_info = struct.unpack_from("<I", data, r_pos + 4)[0]
+                                      if (r_info >> 27) & 1:
+                                          snum = r_info & 0x00FFFFFF
+                                          if snum in old_to_new:
+                                              r_info = (r_info & 0xFF000000) | (old_to_new[snum] & 0x00FFFFFF)
+                                              struct.pack_into("<I", data, r_pos + 4, r_info)
+
+                          indsymoff, nindsyms = struct.unpack_from("<II", data, dysym_off + 56)
+                          for k in range(nindsyms):
+                              ipos = indsymoff + k * 4
+                              val = struct.unpack_from("<I", data, ipos)[0]
+                              if (val & 0xC0000000) == 0 and val in old_to_new:
+                                  struct.pack_into("<I", data, ipos, old_to_new[val])
+                      else:
+                          for idx, (_, fields, _) in enumerate(syms):
+                              struct.pack_into("<IBBHQ", data, symoff + idx * 16, *fields)
+
+                  open(out_file, "wb").write(data)
+          ''')
           tmp_objcopy = pathlib.Path("/tmp/llvm-objcopy-wrapper")
-          tmp_objcopy.write_text(objcopy_clean)
+          tmp_objcopy.write_text(objcopy_wrapper)
           tmp_objcopy.chmod(0o755)
           if not pathlib.Path("/usr/bin/llvm-objcopy.real").exists():
-              subprocess.run(["sudo", "mv", "/usr/bin/llvm-objcopy", "/usr/bin/llvm-objcopy.real"], check=True)
+              real_bin = os.path.realpath("/usr/bin/llvm-objcopy")
+              subprocess.run(["sudo", "cp", "-f", real_bin, "/usr/bin/llvm-objcopy.real"], check=True)
+              subprocess.run(["sudo", "chmod", "+x", "/usr/bin/llvm-objcopy.real"], check=True)
           subprocess.run(["sudo", "cp", "-f", "/tmp/llvm-objcopy-wrapper", "/usr/bin/llvm-objcopy"], check=True)
           subprocess.run(["sudo", "cp", "-f", "/tmp/llvm-objcopy-wrapper", "/opt/unixnu-linux/llvm/bin/llvm-objcopy"], check=True)
 
