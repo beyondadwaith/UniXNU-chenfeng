@@ -28,32 +28,51 @@ jobs:
             unixnu-linux-toolchain-v2
             unixnu-linux-toolchain-v1
 
-      - name: Clone UniXNU-peridot Base
+      - name: Clone UniXNU-peridot & Mu-Silicium UEFI
         run: |
           mkdir -p work && cd work
           git clone --recurse-submodules https://github.com/hoshikv/UniXNU-peridot.git unixnu
+          git clone --depth=1 https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
 
-      - name: Set Up Linux XNU Toolchain (Uses Cache If Available)
+      - name: Set Up Linux XNU Toolchain & Wrap clang-24
         run: |
           cd work/unixnu
           mkdir -p final-output
-          if [ -x /opt/unixnu-linux/llvm/bin/clang ] && [ -d /opt/unixnu-linux/CommandLineTools ]; then
-            echo "Found cached /opt/unixnu-linux toolchain! Checking xcrun..." >> final-output/build.log
-            XCRUN_BIN=$(find /opt/unixnu-linux /usr/local/bin -name "xcrun" -type f 2>/dev/null | head -n 1 || true)
-            if [ -n "$XCRUN_BIN" ] && [ ! -x /usr/local/bin/xcrun ]; then
-              sudo ln -sf "$XCRUN_BIN" /usr/local/bin/xcrun
-            fi
-          fi
-          if ! command -v xcrun >/dev/null 2>&1 || [ ! -x /opt/unixnu-linux/llvm/bin/clang ]; then
-            echo "Running scripts/linux/setup-toolchain.py..." >> final-output/build.log
-            sudo python3 scripts/linux/setup-toolchain.py > final-output/toolchain.log 2>&1
-            sudo cp -f /usr/local/bin/xcrun /opt/unixnu-linux/xcrun.cached 2>/dev/null || true
-          fi
+
+          # 1. Restore xcrun from cache BEFORE checking if toolchain exists
           if [ -f /opt/unixnu-linux/xcrun.cached ] && [ ! -x /usr/local/bin/xcrun ]; then
             sudo cp -f /opt/unixnu-linux/xcrun.cached /usr/local/bin/xcrun
             sudo chmod +x /usr/local/bin/xcrun
           fi
-          echo "Toolchain ready." >> final-output/build.log
+
+          # 2. Only run setup-toolchain.py if not cached
+          if ! command -v xcrun >/dev/null 2>&1 || [ ! -x /opt/unixnu-linux/llvm/bin/clang ]; then
+            echo "Running scripts/linux/setup-toolchain.py..." >> final-output/build.log
+            sudo python3 scripts/linux/setup-toolchain.py > final-output/toolchain.log 2>&1
+            sudo cp -f /usr/local/bin/xcrun /opt/unixnu-linux/xcrun.cached 2>/dev/null || true
+          else
+            echo "Using cached /opt/unixnu-linux toolchain!" >> final-output/build.log
+          fi
+
+          # 3. Wrap clang-24 so -Werror,-Woverriding-option never breaks archive builds
+          if [ ! -f /opt/unixnu-linux/llvm/bin/clang-24.real ]; then
+            sudo mv /opt/unixnu-linux/llvm/bin/clang-24 /opt/unixnu-linux/llvm/bin/clang-24.real
+            cat << 'EOF' | sudo tee /opt/unixnu-linux/llvm/bin/clang-24 >/dev/null
+          #!/usr/bin/env bash
+          if [ "${1:-}" != "-cc1" ] && [ "${1:-}" != "-cc1as" ]; then
+            for arg in "$@"; do
+              case "$arg" in
+                -Werror*|--target=*|-m*os-version-min=*)
+                  exec /opt/unixnu-linux/llvm/bin/clang-24.real "$@" -Wno-overriding-option -Wno-error=overriding-option
+                  ;;
+              esac
+            done
+          fi
+          exec /opt/unixnu-linux/llvm/bin/clang-24.real "$@"
+          EOF
+            sudo chmod +x /opt/unixnu-linux/llvm/bin/clang-24
+          fi
+          echo "Toolchain and clang-24 wrapper ready." >> final-output/build.log
 
       - name: Patch Hardware Values & Fix Clang 24 __ptrauth Macro
         run: |
@@ -66,10 +85,9 @@ jobs:
           # 2. Update model description in peridot.dts
           sed -i 's/Xiaomi Poco F6 \/ Redmi Turbo 3/Xiaomi 14 Civi (chenfeng)/g' dts/peridot.dts
 
-          # 3. Hook prepare-xnu-source.py so 4-arg __ptrauth(..., "authenticates-null-values") is converted to 3-arg for Linux Clang 24
+          # 3. Strip 4th argument from __ptrauth(..., "authenticates-null-values") for Linux Clang 24
           cat << 'EOF' >> scripts/prepare-xnu-source.py
 
-          # Fix 4-argument __ptrauth macro for Linux Clang 24 compatibility
           import pathlib
           for root_dir in [pathlib.Path('.cache/xnu-work'), pathlib.Path('refer/libplatform'), pathlib.Path('.cache/fakeroot')]:
               if root_dir.exists():
@@ -86,40 +104,57 @@ jobs:
           cp dts/peridot.dts final-output/chenfeng.dts
           cp board.toml final-output/
 
-      - name: Fetch Feeds, Build DTB, Package & Kernel
+      - name: Fetch Feeds, IPSW, Build DTB, Package, Kernel & Firmware
         run: |
           cd work/unixnu
           export JOBS=$(nproc)
+          export C_INCLUDE_PATH=/usr/include/x86_64-linux-gnu
+          export CPLUS_INCLUDE_PATH=/usr/include/x86_64-linux-gnu
           {
-            echo "=== 1. Running unixnu defconfig ==="
+            echo "=== 1. Running unixnu defconfig & fetch ==="
             ./unixnu defconfig peridot_defconfig -D .
-
-            echo "=== 2. Running unixnu fetch ==="
             ./unixnu fetch
 
-            # Also strip 4-arg __ptrauth in fetched feeds directly
+            # Strip 4-arg __ptrauth in fetched feeds
             grep -rl '"authenticates-null-values"' out/feeds/ 2>/dev/null | xargs -r sed -i 's/, *"authenticates-null-values"//g' || true
 
-            echo "=== 3. Assembling build tree ==="
-            ./unixnu tree
+            echo "=== 2. Fetching IPSW KernelCache via Range Requests ==="
+            ./unixnu ipsw info || true
+            ./unixnu ipsw fetch || true
 
-            echo "=== 4. Compiling chenfeng.dtb ==="
+            echo "=== 3. Assembling build tree & Compiling chenfeng.dtb ==="
+            ./unixnu tree
             SOC_DTS_DIR=$(find out -type f -name "sm8550.dtsi" -printf "%h\n" | head -n 1)
             dtc -I dts -O dtb -i "$SOC_DTS_DIR" -i dts -o final-output/chenfeng.dtb dts/peridot.dts
             echo "Compiled final-output/chenfeng.dtb successfully!"
 
-            echo "=== 5. Building UEFI Package (UniXNU.efi) ==="
-            C_INCLUDE_PATH=/usr/include/x86_64-linux-gnu CPLUS_INCLUDE_PATH=/usr/include/x86_64-linux-gnu ./unixnu build package || true
+            echo "=== 4. Building UEFI Package (UniXNU.efi) ==="
+            ./unixnu build package || true
 
-            echo "=== 6. Building XNU Kernel ==="
+            echo "=== 5. Building XNU Kernel & Driver Archives ==="
             ./unixnu build kernel || true
+
+            echo "=== 6. Building Mu-Silicium UEFI Firmware & Boot Image ==="
+            ./unixnu build firmware --uefi ../Mu-Silicium || true
+            ./unixnu build payload || true
+            ./unixnu bootimg --uefi ../Mu-Silicium || true
 
           } 2>&1 | tee -a final-output/build.log
 
-      - name: Collect Outputs & Failure Logs
+      - name: Collect Compiled Binaries & Log Summaries
         run: |
           cd work/unixnu
-          find build out -type f \( -name "*.efi" -o -name "*.macho" -o -name "*.unstripped" -o -name "*.img" -o -name "*.fd" -o -name "*.dtb" -o -name "*.log" \) -exec cp --parents {} final-output/ \; 2>/dev/null || true
+          # Copy only compiled binaries and reports (skip 200MB raw bootstrap logs)
+          find build out ../Mu-Silicium/Build -type f \( -name "*.efi" -o -name "*.macho" -o -name "*.unstripped" -o -name "*.img" -o -name "*.fd" -o -name "*.dtb" -o -name "boot*.json" -o -name "payload.json" \) -exec cp --parents {} final-output/ \; 2>/dev/null || true
+          
+          echo "=== Tail of Step Logs ===" >> final-output/build.log
+          for lfile in out/peridot/ios-27.0.1-24A446/peridot/logs/*.log; do
+            if [ -f "$lfile" ] && [[ "$lfile" != *"kernel-bootstrap.log" ]]; then
+              echo "--- $lfile (last 25 lines) ---" >> final-output/build.log
+              tail -n 25 "$lfile" >> final-output/build.log
+            fi
+          done
+
           echo "=== Final Collected Files ===" >> final-output/build.log
           ls -lhR final-output/ >> final-output/build.log
 
