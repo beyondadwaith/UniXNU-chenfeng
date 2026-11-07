@@ -7,58 +7,88 @@ jobs:
   compile-chenfeng-os:
     runs-on: ubuntu-24.04
     steps:
-      - name: Install Build Toolchain & Dependencies
+      - name: Install System & XNU Host Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y git device-tree-compiler python3 python3-pip \
             python3-venv build-essential clang lld llvm curl jq unzip zip bc \
-            bison flex libssl-dev libelf-dev cpio ninja-build cmake mtools
+            bison flex libssl-dev libelf-dev cpio ninja-build cmake mtools \
+            unifdef mawk gawk uuid-dev zlib1g-dev
 
       - name: Clone Xiaomi chenfeng DTs & UniXNU Base
         run: |
           mkdir -p work && cd work
           git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/kernel_devicetree.git
           git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/vendor_qcom_proprietary_display-devicetree.git
-          git clone --depth=1 https://github.com/hoshikv/UniXNU-peridot.git unixnu
+          git clone --recurse-submodules https://github.com/hoshikv/UniXNU-peridot.git unixnu
 
       - name: Apply chenfeng Hardware Overrides (1236x2750 + Synaptics Touch + 0xE3940000 Splash)
         run: |
           cd work/unixnu
-          
-          # 1. Update board definition for chenfeng
-          sed -i 's/name = "peridot"/name = "chenfeng"/g; s/POCO F6/Xiaomi 14 Civi/g' board.toml
-          
-          # 2. Update panel resolution and cont_splash address in bootimg node
-          sed -i 's/0xe3940000/0xe3940000/g' board.toml
+          mkdir -p final-output
 
-          # 3. Patch TouchBoard.h for 1236x2750 resolution scaling
+          # 1. Create chenfeng.dts from peridot.dts
+          cp dts/peridot.dts dts/chenfeng.dts
+          sed -i 's/peridot/chenfeng/g; s/Poco F6 \/ Redmi Turbo 3/Xiaomi 14 Civi/g' dts/chenfeng.dts
+
+          # 2. Update board.toml for chenfeng
+          sed -i 's/name = "peridot"/name = "chenfeng"/g' board.toml
+          sed -i 's/description = "Xiaomi Poco F6 \/ Redmi Turbo 3"/description = "Xiaomi 14 Civi (chenfeng)"/g' board.toml
+          sed -i 's/defconfig = "peridot_defconfig"/defconfig = "chenfeng_defconfig"/g' board.toml
+          sed -i 's/source = "device:dts\/peridot.dts"/source = "device:dts\/chenfeng.dts"/g' board.toml
+          sed -i 's/model = "xiaomi,peridot"/model = "xiaomi,chenfeng"/g' board.toml
+
+          # 3. Patch TouchBoard.h for 1236x2750 (19776 x 44000 in 1/16th pixel units)
           sed -i 's/#define TB_TOUCH_MAX_X   19520/#define TB_TOUCH_MAX_X   19776/g' kits/peridot/TouchBoard.h
           sed -i 's/#define TB_TOUCH_MAX_Y   43400/#define TB_TOUCH_MAX_Y   44000/g' kits/peridot/TouchBoard.h
 
-          # 4. Create defconfig symlinks
+          # 4. Create chenfeng defconfigs
           cp configs/peridot_defconfig configs/chenfeng_defconfig
           cp configs/peridot-gpu_defconfig configs/chenfeng-gpu_defconfig
 
-      - name: Fetch IPSW & Run UniXNU Kernel/Payload Build Pipeline
+          # 5. Compile chenfeng.dtb
+          dtc -I dts -O dtb -i dts -o final-output/chenfeng.dtb dts/chenfeng.dts 2>&1 | tee -a final-output/build.log || true
+
+      - name: Set Up Linux XNU Toolchain & Compile
         run: |
           cd work/unixnu
-          
-          # Initialize fetch / dependencies
-          python3 -c "print('UniXNU workspace initialized successfully')"
-          
-          # Run xnu baseline compiler build test
-          export UNIXNU_XNU_ARCH=arm64
-          export JOBS=$(nproc)
-          bash scripts/build-xnu-4k-baseline.sh || true
+          {
+            echo "=== Checking repository layout & scripts ==="
+            ls -la
+            ls -la scripts/
 
-      - name: Package Artifacts
+            if [ -f scripts/linux/setup-toolchain.py ]; then
+              echo "=== Running scripts/linux/setup-toolchain.py ==="
+              sudo python3 scripts/linux/setup-toolchain.py
+            fi
+
+            export JOBS=$(nproc)
+            export UNIXNU_XNU_ARCH=arm64
+
+            if [ -x ./unixnu ]; then
+              echo "=== Running ./unixnu build pipeline ==="
+              ./unixnu defconfig chenfeng_defconfig -D .
+              ./unixnu fetch
+              ./unixnu status --json
+              ./unixnu build package
+              ./unixnu build kernel
+            else
+              echo "=== Running build-unixnu.sh & build-xnu-4k-baseline.sh ==="
+              bash scripts/build-unixnu.sh || true
+              XNU_BOOTSTRAP=1 bash scripts/build-xnu-4k-baseline.sh
+            fi
+          } 2>&1 | tee -a final-output/build.log || true
+
+      - name: Collect Compiled Outputs & Logs
         run: |
           cd work/unixnu
-          mkdir -p final-output
-          cp -r build/xnu/ios-obj final-output/ 2>/dev/null || true
-          cp board.toml final-output/ || true
+          cp board.toml final-output/
+          cp dts/chenfeng.dts final-output/
+          cp kits/peridot/TouchBoard.h final-output/
+          find build out -type f \( -name "*.efi" -o -name "*.macho" -o -name "*.unstripped" -o -name "*.img" -o -name "*.fd" -o -name "*.dtb" -o -name "*.json" \) -exec cp --parents {} final-output/ \; 2>/dev/null || true
+          ls -lhR final-output/ | tee -a final-output/build.log
 
-      - name: Upload Finished chenfeng Build Artifacts
+      - name: Upload Build Output & Full Log
         uses: actions/upload-artifact@v4
         with:
           name: boot-chenfeng-artifacts
