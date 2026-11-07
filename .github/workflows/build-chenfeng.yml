@@ -1,0 +1,61 @@
+name: Auto-Extract & Build Xiaomi 14 Civi (chenfeng) iOS Port
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: 'Direct Apple IPSW URL (Optional - leave blank to run hardware extraction + ADT/UEFI config generation first)'
+        required: false
+        default: ''
+
+jobs:
+  extract-and-prepare-chenfeng:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install Device Tree & Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git device-tree-compiler python3 python3-pip \
+            python3-venv build-essential clang lld llvm curl jq unzip zip bc \
+            bison flex libssl-dev libelf-dev cpio
+
+      - name: Clone Official Xiaomi 14 Civi (chenfeng-u-oss) Device Trees
+        run: |
+          mkdir -p work && cd work
+          echo "Cloning MiCode kernel_devicetree (chenfeng-u-oss)..."
+          git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/kernel_devicetree.git
+          echo "Cloning MiCode display-devicetree (chenfeng-u-oss)..."
+          git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/vendor_qcom_proprietary_display-devicetree.git
+
+      - name: Clone SM8635 Sibling Base (UniXNU-peridot)
+        run: |
+          cd work
+          git clone --depth=1 https://github.com/hoshikv/UniXNU-peridot.git || \
+          git clone --depth=1 https://github.com/wzy114514sb/UniXNU-peridot.git UniXNU-peridot
+
+      - name: Extract chenfeng Hardware Map & Generate Port Configs
+        run: |
+          cd work
+          mkdir -p chenfeng-extracted
+          
+          echo "=== 1. Searching chenfeng/cliffs Memory Map & Reserved Carveouts ===" | tee chenfeng-extracted/hardware-report.txt
+          grep -rn -C 15 "reserved-memory\|cont_splash\|pil_\|mpss\|adsp\|cdsp" kernel_devicetree/ vendor_qcom_proprietary_display-devicetree/ >> chenfeng-extracted/hardware-report.txt || true
+          
+          echo "=== 2. Searching chenfeng Display Panel & Framebuffer ===" | tee -a chenfeng-extracted/hardware-report.txt
+          find vendor_qcom_proprietary_display-devicetree/ -name "*chenfeng*" -o -name "*cliffs*" | tee -a chenfeng-extracted/hardware-report.txt
+          grep -rn -C 10 "qcom,mdss-dsi-panel-width\|qcom,mdss-dsi-panel-height\|cont_splash" vendor_qcom_proprietary_display-devicetree/ >> chenfeng-extracted/hardware-report.txt || true
+
+          echo "=== 3. Searching Touchscreen (Goodix / Focaltech / Xiaomi Touch) ===" | tee -a chenfeng-extracted/hardware-report.txt
+          grep -rn -i -C 12 "focaltech\|goodix\|xiaomi,touch\|fts_ts" kernel_devicetree/ >> chenfeng-extracted/hardware-report.txt || true
+
+          echo "=== 4. Copying all chenfeng & cliffs DTSI files ==="
+          find kernel_devicetree/ -name "*chenfeng*" -o -name "*cliffs*" | xargs -I {} cp --parents {} chenfeng-extracted/
+          find vendor_qcom_proprietary_display-devicetree/ -name "*chenfeng*" -o -name "*cliffs*" | xargs -I {} cp --parents {} chenfeng-extracted/
+          
+          cp -r UniXNU-peridot chenfeng-extracted/UniXNU-peridot-reference
+
+      - name: Upload Extracted chenfeng Descriptors & Reference Tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: chenfeng-hardware-and-port-files
+          path: work/chenfeng-extracted/
