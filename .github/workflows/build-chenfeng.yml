@@ -10,11 +10,12 @@ jobs:
       - name: Install Host Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git patch flex bison bzip2 cpio rsync curl wget \
-            ca-certificates tcsh unifdef cmake clang lld mtools build-essential \
+          sudo apt-get install -y git patch flex bison byacc bzip2 cpio rsync curl wget \
+            ca-certificates tcsh unifdef cmake meson clang lld mtools build-essential \
             gcc-multilib pkg-config ninja-build python3 python3-dev python3-pip \
-            python3-venv xz-utils libssl-dev zlib1g-dev libbsd-dev uuid-dev \
-            llvm-dev libclang-dev device-tree-compiler bc jq unzip zip gawk mawk
+            python3-venv python3-mako python3-yaml xz-utils libssl-dev zlib1g-dev \
+            libbsd-dev uuid-dev llvm-dev libclang-dev device-tree-compiler bc jq \
+            unzip zip gawk mawk
           sudo mkdir -p /opt/unixnu-linux
           sudo chown -R runner:runner /opt/unixnu-linux
 
@@ -52,7 +53,7 @@ jobs:
           if [ ! -f /opt/unixnu-linux/llvm/bin/clang-24.real ]; then
             sudo mv /opt/unixnu-linux/llvm/bin/clang-24 /opt/unixnu-linux/llvm/bin/clang-24.real
           fi
-          sudo python3 -c 'import pathlib; p = pathlib.Path("/opt/unixnu-linux/llvm/bin/clang-24"); p.write_text("#!/usr/bin/env python3\nimport os, sys\nreal = \"/opt/unixnu-linux/llvm/bin/clang-24.real\"\nargs = sys.argv[1:]\nif not args or args[0] not in (\"-cc1\", \"-cc1as\"):\n    if any(a.startswith(\"--target=\") or a == \"-target\" for a in args):\n        args = [a for a in args if not a.startswith((\"-mios-version-min=\", \"-miphoneos-version-min=\", \"-mmacosx-version-min=\"))]\n    args.extend([\"-Wno-overriding-option\", \"-Wno-error=overriding-option\"])\nos.execv(real, [real] + args)\n"); p.chmod(0o755)'
+          sudo python3 -c 'import pathlib; p = pathlib.Path("/opt/unixnu-linux/llvm/bin/clang-24"); p.write_text("#!/usr/bin/env python3\nimport os, re, sys\nreal = \"/opt/unixnu-linux/llvm/bin/clang-24.real\"\nargs = sys.argv[1:]\nif not args or args[0] not in (\"-cc1\", \"-cc1as\"):\n    ver = None\n    for a in args:\n        if a.startswith((\"-mios-version-min=\", \"-miphoneos-version-min=\")):\n            ver = a.split(\"=\", 1)[1]\n    if ver and any(\"apple-ios\" in a for a in args):\n        new_args = []\n        for a in args:\n            if a.startswith((\"-mios-version-min=\", \"-miphoneos-version-min=\")):\n                continue\n            if \"apple-ios\" in a:\n                a = re.sub(r\"(apple-ios)[0-9.]+\", rf\"\\g<1>{ver}\", a)\n            new_args.append(a)\n        args = new_args\n    args.extend([\"-Wno-overriding-option\", \"-Wno-error=overriding-option\"])\nos.execv(real, [real] + args)\n"); p.chmod(0o755)'
           sudo chown -R runner:runner /opt/unixnu-linux
           echo "Toolchain and clang-24 wrapper ready." >> final-output/build.log
 
@@ -84,7 +85,6 @@ jobs:
 
             echo "=== 3. Assembling build tree & Compiling DTB ==="
             ./unixnu tree
-            ./unixnu build dtb || true
             SOC_DTS_DIR=$(find out -type f -name "sm8550.dtsi" -printf "%h\n" | head -n 1)
             dtc -I dts -O dtb -i "$SOC_DTS_DIR" -i dts -o final-output/chenfeng.dtb dts/peridot.dts
             echo "Compiled final-output/chenfeng.dtb successfully!"
@@ -98,7 +98,7 @@ jobs:
             echo "=== 6. Building Mu-Silicium UEFI Firmware & Boot Image ==="
             ./unixnu build firmware --uefi ../Mu-Silicium || true
             ./unixnu build payload || true
-            ./unixnu bootimg --uefi ../Mu-Silicium --dtb final-output/chenfeng.dtb -o final-output/boot-chenfeng.img || ./unixnu bootimg --uefi ../Mu-Silicium || true
+            ./unixnu bootimg --uefi ../Mu-Silicium --dtb final-output/chenfeng.dtb -o final-output/boot-chenfeng.img || true
           } 2>&1 | tee -a final-output/build.log
 
       - name: Collect Compiled Binaries & Log Summaries
