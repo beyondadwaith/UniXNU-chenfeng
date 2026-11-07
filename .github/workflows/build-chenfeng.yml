@@ -7,7 +7,7 @@ jobs:
   compile-chenfeng-os:
     runs-on: ubuntu-24.04
     steps:
-      - name: Install System & XNU Host Dependencies
+      - name: Install Build Toolchain & Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y git device-tree-compiler python3 python3-pip \
@@ -20,45 +20,51 @@ jobs:
           mkdir -p work && cd work
           git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/kernel_devicetree.git
           git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/vendor_qcom_proprietary_display-devicetree.git
-          git clone --recurse-submodules https://github.com/hoshikv/UniXNU-peridot.git unixnu
+          git clone --depth=1 https://github.com/hoshikv/UniXNU-peridot.git unixnu
 
-      - name: Apply chenfeng Hardware Overrides (1236x2750 + Synaptics Touch + 0xE3940000 Splash)
+      - name: Link Shared SM8550 SoC Headers & Apply Hardware Overrides
         run: |
           cd work/unixnu
           mkdir -p final-output
 
-          # 1. Create chenfeng.dts from peridot.dts
+          # 1. Pull required SM8550 headers from kernel_devicetree into dts include path
+          if [ -d "../kernel_devicetree/qcom" ]; then
+            cp -n ../kernel_devicetree/qcom/*.dtsi dts/ 2>/dev/null || true
+            cp -n ../kernel_devicetree/qcom/*.h dts/ 2>/dev/null || true
+          fi
+          
+          # Explicitly download sm8550.dtsi if missing
+          if [ ! -f "dts/sm8550.dtsi" ]; then
+            curl -s https://raw.githubusercontent.com/MiCode/kernel_devicetree/chenfeng-u-oss/qcom/sm8550.dtsi -o dts/sm8550.dtsi || true
+          fi
+
+          # 2. Create chenfeng.dts from peridot.dts
           cp dts/peridot.dts dts/chenfeng.dts
           sed -i 's/peridot/chenfeng/g; s/Poco F6 \/ Redmi Turbo 3/Xiaomi 14 Civi/g' dts/chenfeng.dts
 
-          # 2. Update board.toml for chenfeng
+          # 3. Update board.toml for chenfeng
           sed -i 's/name = "peridot"/name = "chenfeng"/g' board.toml
           sed -i 's/description = "Xiaomi Poco F6 \/ Redmi Turbo 3"/description = "Xiaomi 14 Civi (chenfeng)"/g' board.toml
           sed -i 's/defconfig = "peridot_defconfig"/defconfig = "chenfeng_defconfig"/g' board.toml
           sed -i 's/source = "device:dts\/peridot.dts"/source = "device:dts\/chenfeng.dts"/g' board.toml
           sed -i 's/model = "xiaomi,peridot"/model = "xiaomi,chenfeng"/g' board.toml
 
-          # 3. Patch TouchBoard.h for 1236x2750 (19776 x 44000 in 1/16th pixel units)
+          # 4. Patch TouchBoard.h for 1236x2750 (19776 x 44000 in 1/16th pixel units)
           sed -i 's/#define TB_TOUCH_MAX_X   19520/#define TB_TOUCH_MAX_X   19776/g' kits/peridot/TouchBoard.h
           sed -i 's/#define TB_TOUCH_MAX_Y   43400/#define TB_TOUCH_MAX_Y   44000/g' kits/peridot/TouchBoard.h
 
-          # 4. Create chenfeng defconfigs
+          # 5. Create chenfeng defconfigs
           cp configs/peridot_defconfig configs/chenfeng_defconfig
           cp configs/peridot-gpu_defconfig configs/chenfeng-gpu_defconfig
 
-          # 5. Compile chenfeng.dtb
+          # 6. Compile chenfeng.dtb
           dtc -I dts -O dtb -i dts -o final-output/chenfeng.dtb dts/chenfeng.dts 2>&1 | tee -a final-output/build.log || true
 
       - name: Set Up Linux XNU Toolchain & Compile
         run: |
           cd work/unixnu
           {
-            echo "=== Checking repository layout & scripts ==="
-            ls -la
-            ls -la scripts/
-
             if [ -f scripts/linux/setup-toolchain.py ]; then
-              echo "=== Running scripts/linux/setup-toolchain.py ==="
               sudo python3 scripts/linux/setup-toolchain.py
             fi
 
@@ -66,14 +72,12 @@ jobs:
             export UNIXNU_XNU_ARCH=arm64
 
             if [ -x ./unixnu ]; then
-              echo "=== Running ./unixnu build pipeline ==="
               ./unixnu defconfig chenfeng_defconfig -D .
               ./unixnu fetch
               ./unixnu status --json
               ./unixnu build package
               ./unixnu build kernel
             else
-              echo "=== Running build-unixnu.sh & build-xnu-4k-baseline.sh ==="
               bash scripts/build-unixnu.sh || true
               XNU_BOOTSTRAP=1 bash scripts/build-xnu-4k-baseline.sh
             fi
