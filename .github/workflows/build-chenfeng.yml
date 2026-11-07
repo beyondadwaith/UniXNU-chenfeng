@@ -24,8 +24,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/unixnu-linux
-          key: unixnu-linux-toolchain-v3
+          key: unixnu-linux-toolchain-v4
           restore-keys: |
+            unixnu-linux-toolchain-v4
             unixnu-linux-toolchain-v3
             unixnu-linux-toolchain-v2
 
@@ -35,10 +36,13 @@ jobs:
           git clone --recurse-submodules https://github.com/hoshikv/UniXNU-peridot.git unixnu
           git clone --depth=1 https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
 
-      - name: Set Up Linux XNU Toolchain & Wrap clang-24
+      - name: Set Up Linux XNU Toolchain
         run: |
           cd work/unixnu
           mkdir -p final-output
+          if [ -d /opt/unixnu-linux/usr-local-bin ]; then
+            sudo cp -af /opt/unixnu-linux/usr-local-bin/* /usr/local/bin/ 2>/dev/null || true
+          fi
           if [ -f /opt/unixnu-linux/xcrun.cached ] && [ ! -x /usr/local/bin/xcrun ]; then
             sudo cp -f /opt/unixnu-linux/xcrun.cached /usr/local/bin/xcrun
             sudo chmod +x /usr/local/bin/xcrun
@@ -46,27 +50,180 @@ jobs:
           if ! command -v xcrun >/dev/null 2>&1 || [ ! -e /opt/unixnu-linux/llvm/bin/clang ]; then
             echo "Running scripts/linux/setup-toolchain.py..." >> final-output/build.log
             sudo python3 scripts/linux/setup-toolchain.py > final-output/toolchain.log 2>&1
+            sudo mkdir -p /opt/unixnu-linux/usr-local-bin
+            sudo cp -af /usr/local/bin/* /opt/unixnu-linux/usr-local-bin/ 2>/dev/null || true
             sudo cp -f /usr/local/bin/xcrun /opt/unixnu-linux/xcrun.cached 2>/dev/null || true
           else
             echo "Using cached /opt/unixnu-linux toolchain!" >> final-output/build.log
           fi
-          if [ ! -f /opt/unixnu-linux/llvm/bin/clang-24.real ]; then
-            sudo mv /opt/unixnu-linux/llvm/bin/clang-24 /opt/unixnu-linux/llvm/bin/clang-24.real
-          fi
-          sudo python3 -c 'import pathlib; p = pathlib.Path("/opt/unixnu-linux/llvm/bin/clang-24"); p.write_text("#!/usr/bin/env python3\nimport os, re, sys\nreal = \"/opt/unixnu-linux/llvm/bin/clang-24.real\"\nargs = sys.argv[1:]\nif not args or args[0] not in (\"-cc1\", \"-cc1as\"):\n    ver = None\n    for a in args:\n        if a.startswith((\"-mios-version-min=\", \"-miphoneos-version-min=\")):\n            ver = a.split(\"=\", 1)[1]\n    if ver and any(\"apple-ios\" in a for a in args):\n        new_args = []\n        for a in args:\n            if a.startswith((\"-mios-version-min=\", \"-miphoneos-version-min=\")):\n                continue\n            if \"apple-ios\" in a:\n                a = re.sub(r\"(apple-ios)[0-9.]+\", rf\"\\g<1>{ver}\", a)\n            new_args.append(a)\n        args = new_args\n    args.extend([\"-Wno-overriding-option\", \"-Wno-error=overriding-option\"])\nos.execv(real, [real] + args)\n"); p.chmod(0o755)'
           sudo chown -R runner:runner /opt/unixnu-linux
-          echo "Toolchain and clang-24 wrapper ready." >> final-output/build.log
 
-      - name: Patch Hardware Values & Fix Clang 24 __ptrauth Macro
+      - name: Install clang-24, llvm-objcopy & __ptrauth Wrappers
+        shell: python3
         run: |
-          cd work/unixnu
-          sed -i 's/#define TB_TOUCH_MAX_X   19520/#define TB_TOUCH_MAX_X   19776/g' kits/peridot/TouchBoard.h
-          sed -i 's/#define TB_TOUCH_MAX_Y   43400/#define TB_TOUCH_MAX_Y   44000/g' kits/peridot/TouchBoard.h
-          sed -i 's/Xiaomi Poco F6 \/ Redmi Turbo 3/Xiaomi 14 Civi (chenfeng)/g' dts/peridot.dts
-          python3 -c 'import pathlib; p = pathlib.Path("scripts/prepare-xnu-source.py"); p.write_text(p.read_text() + "\nimport pathlib\nfor d in [\".cache/xnu-work\", \"refer/libplatform\", \".cache/fakeroot\"]:\n    r = pathlib.Path(d)\n    if r.exists():\n        for h in r.rglob(\"*.h\"):\n            t = h.read_text(errors=\"ignore\")\n            if \"authenticates-null-values\" in t:\n                h.write_text(t.replace(\", \\\"authenticates-null-values\\\"\", \"\"))\n")'
-          cp kits/peridot/TouchBoard.h final-output/
-          cp dts/peridot.dts final-output/chenfeng.dts
-          cp board.toml final-output/
+          import pathlib, shutil, subprocess
+
+          # 1. Wrap clang-24 to normalize iOS deployment target to 27.0
+          clang_path = pathlib.Path("/opt/unixnu-linux/llvm/bin/clang-24")
+          clang_real = pathlib.Path("/opt/unixnu-linux/llvm/bin/clang-24.real")
+          if not clang_real.exists():
+              shutil.move(str(clang_path), str(clang_real))
+
+          clang_wrapper = '''#!/usr/bin/env python3
+          import os, re, sys
+          real = "/opt/unixnu-linux/llvm/bin/clang-24.real"
+          args = sys.argv[1:]
+          if not args or args[0] not in ("-cc1", "-cc1as"):
+              ver = "27.0"
+              for a in args:
+                  if a.startswith(("-mios-version-min=", "-miphoneos-version-min=")):
+                      ver = a.split("=", 1)[1]
+              if any("apple-ios" in a for a in args):
+                  new_args = []
+                  for a in args:
+                      if a.startswith(("-mios-version-min=", "-miphoneos-version-min=")):
+                          continue
+                      if "apple-ios" in a:
+                          a = re.sub(r"(apple-ios)[0-9.]+", rf"\\g<1>{ver}", a)
+                      new_args.append(a)
+                  args = new_args
+              args.extend(["-Wno-overriding-option", "-Wno-error=overriding-option"])
+          os.execv(real, [real] + args)
+          '''
+          clang_path.write_text("\n".join(line.strip() if i == 0 else line[10:] for i, line in enumerate(clang_wrapper.strip().splitlines())) + "\n")
+          clang_path.chmod(0o755)
+
+          # 2. Wrap /usr/bin/llvm-objcopy to support --globalize-symbol on Mach-O
+          objcopy_Script = '''#!/usr/bin/env python3
+          import os, shutil, struct, subprocess, sys
+
+          real = "/usr/bin/llvm-objcopy.real"
+          args = sys.argv[1:]
+          globalize = []
+          pass_args = []
+          i = 0
+          while i < len(args):
+              a = args[i]
+              if a.startswith("--globalize-symbol="):
+                  globalize.append(a.split("=", 1)[1])
+              elif a == "--globalize-symbol" and i + 1 < len(args):
+                  globalize.append(args[i + 1])
+                  i += 1
+              else:
+                  pass_args.append(a)
+              i += 1
+
+          if not globalize:
+              os.execv(real, [real] + args)
+
+          pos = [a for a in pass_args if not a.startswith("-")]
+          opt = [a for a in pass_args if a.startswith("-")]
+          in_file = pos[0]
+          out_file = pos[1] if len(pos) > 1 else in_file
+
+          if opt:
+              res = subprocess.run([real] + pass_args)
+              if res.returncode != 0:
+                  sys.exit(res.returncode)
+          elif in_file != out_file:
+              shutil.copyfile(in_file, out_file)
+
+          data = bytearray(open(out_file, "rb").read())
+          if len(data) >= 32 and struct.unpack_from("<I", data, 0)[0] == 0xFEEDFACF:
+              ncmds = struct.unpack_from("<I", data, 16)[0]
+              off = 32
+              symtab_off = dysym_off = None
+              segs = []
+              for _ in range(ncmds):
+                  cmd, cmdsize = struct.unpack_from("<II", data, off)
+                  if cmd == 0x2:
+                      symtab_off = off
+                  elif cmd == 0xB:
+                      dysym_off = off
+                  elif cmd == 0x19:
+                      segs.append(off)
+                  off += cmdsize
+
+              if symtab_off is not None:
+                  _, _, symoff, nsyms, stroff, strsize = struct.unpack_from("<6I", data, symtab_off)
+                  targets = set()
+                  for g in globalize:
+                      targets.add(g)
+                      targets.add("_" + g)
+                      targets.add(g.lstrip("_"))
+
+                  syms = []
+                  for idx in range(nsyms):
+                      s_pos = symoff + idx * 16
+                      n_strx, n_type, n_sect, n_desc, n_value = struct.unpack_from("<IBBHQ", data, s_pos)
+                      end = data.find(0, stroff + n_strx)
+                      name = data[stroff + n_strx : end].decode("utf-8", "ignore") if end != -1 else ""
+                      if name in targets or name.lstrip("_") in targets:
+                          n_type = (n_type | 0x01) & ~0x10
+                      syms.append((idx, [n_strx, n_type, n_sect, n_desc, n_value], name))
+
+                  if dysym_off is not None:
+                      loc = [s for s in syms if (s[1][1] & 0x01) == 0]
+                      ext = [s for s in syms if (s[1][1] & 0x01) != 0 and (s[1][1] & 0x0E) != 0]
+                      und = [s for s in syms if (s[1][1] & 0x01) != 0 and (s[1][1] & 0x0E) == 0]
+                      ext.sort(key=lambda x: x[2])
+                      new_syms = loc + ext + und
+                      old_to_new = {orig_i: new_i for new_i, (orig_i, _, _) in enumerate(new_syms)}
+
+                      for new_i, (_, fields, _) in enumerate(new_syms):
+                          struct.pack_into("<IBBHQ", data, symoff + new_i * 16, *fields)
+
+                      struct.pack_into("<6I", data, dysym_off + 8, 0, len(loc), len(loc), len(ext), len(loc) + len(ext), len(und))
+
+                      for seg_off in segs:
+                          nsects = struct.unpack_from("<I", data, seg_off + 64)[0]
+                          for s_i in range(nsects):
+                              sect_off = seg_off + 72 + s_i * 80
+                              reloff, nreloc = struct.unpack_from("<II", data, sect_off + 56)
+                              for r_i in range(nreloc):
+                                  r_pos = reloff + r_i * 8
+                                  r_info = struct.unpack_from("<I", data, r_pos + 4)[0]
+                                  if (r_info >> 27) & 1:
+                                      snum = r_info & 0x00FFFFFF
+                                      if snum in old_to_new:
+                                          r_info = (r_info & 0xFF000000) | (old_to_new[snum] & 0x00FFFFFF)
+                                          struct.pack_into("<I", data, r_pos + 4, r_info)
+
+                      indsymoff, nindsyms = struct.unpack_from("<II", data, dysym_off + 56)
+                      for k in range(nindsyms):
+                          ipos = indsymoff + k * 4
+                          val = struct.unpack_from("<I", data, ipos)[0]
+                          if (val & 0xC0000000) == 0 and val in old_to_new:
+                              struct.pack_into("<I", data, ipos, old_to_new[val])
+                  else:
+                      for idx, (_, fields, _) in enumerate(syms):
+                          struct.pack_into("<IBBHQ", data, symoff + idx * 16, *fields)
+
+              open(out_file, "wb").write(data)
+          '''
+          objcopy_clean = "\n".join(line.strip() if i == 0 else line[10:] for i, line in enumerate(objcopy_Script.strip().splitlines())) + "\n"
+          tmp_objcopy = pathlib.Path("/tmp/llvm-objcopy-wrapper")
+          tmp_objcopy.write_text(objcopy_clean)
+          tmp_objcopy.chmod(0o755)
+          if not pathlib.Path("/usr/bin/llvm-objcopy.real").exists():
+              subprocess.run(["sudo", "mv", "/usr/bin/llvm-objcopy", "/usr/bin/llvm-objcopy.real"], check=True)
+          subprocess.run(["sudo", "cp", "-f", "/tmp/llvm-objcopy-wrapper", "/usr/bin/llvm-objcopy"], check=True)
+          subprocess.run(["sudo", "cp", "-f", "/tmp/llvm-objcopy-wrapper", "/opt/unixnu-linux/llvm/bin/llvm-objcopy"], check=True)
+
+          # 3. Patch TouchBoard.h, peridot.dts, and prepare-xnu-source.py
+          repo = pathlib.Path("work/unixnu")
+          tb = repo / "kits/peridot/TouchBoard.h"
+          tb.write_text(tb.read_text().replace("#define TB_TOUCH_MAX_X   19520", "#define TB_TOUCH_MAX_X   19776").replace("#define TB_TOUCH_MAX_Y   43400", "#define TB_TOUCH_MAX_Y   44000"))
+
+          dts = repo / "dts/peridot.dts"
+          dts.write_text(dts.read_text().replace("Xiaomi Poco F6 / Redmi Turbo 3", "Xiaomi 14 Civi (chenfeng)"))
+
+          prep = repo / "scripts/prepare-xnu-source.py"
+          prep.write_text(prep.read_text() + '\nimport pathlib\nfor d in [".cache/xnu-work", "refer/libplatform", ".cache/fakeroot"]:\n    r = pathlib.Path(d)\n    if r.exists():\n        for h in r.rglob("*.h"):\n            t = h.read_text(errors="ignore")\n            if "authenticates-null-values" in t:\n                h.write_text(t.replace(", \\"authenticates-null-values\\"", ""))\n')
+
+          shutil.copyfile(tb, repo / "final-output/TouchBoard.h")
+          shutil.copyfile(dts, repo / "final-output/chenfeng.dts")
+          shutil.copyfile(repo / "board.toml", repo / "final-output/board.toml")
 
       - name: Fetch Feeds, IPSW, Build DTB, Package, Kernel & Boot Image
         run: |
