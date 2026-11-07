@@ -7,97 +7,96 @@ jobs:
   compile-chenfeng-os:
     runs-on: ubuntu-24.04
     steps:
-      - name: Install Build Toolchain & Dependencies
+      - name: Install Host Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git device-tree-compiler python3 python3-pip \
-            python3-venv build-essential clang lld llvm curl jq unzip zip bc \
-            bison flex libssl-dev libelf-dev cpio ninja-build cmake mtools \
-            unifdef mawk gawk uuid-dev zlib1g-dev
+          sudo apt-get install -y git patch flex bison bzip2 cpio rsync curl wget \
+            ca-certificates tcsh unifdef cmake clang lld mtools build-essential \
+            pkg-config ninja-build python3 python3-dev python3-pip python3-venv \
+            xz-utils libssl-dev zlib1g-dev libbsd-dev uuid-dev llvm-dev \
+            libclang-dev device-tree-compiler bc jq unzip zip gawk mawk
 
-      - name: Clone UniXNU, SM8550 SoC Common & Xiaomi chenfeng DTs
+      - name: Cache Linux XNU Toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: /opt/unixnu-linux
+          key: unixnu-linux-toolchain-v1
+
+      - name: Clone UniXNU-peridot Base
         run: |
           mkdir -p work && cd work
-          git clone --depth=1 https://github.com/UniXNU/UniXNU.git unixnu || git clone --depth=1 https://github.com/hoshikv/UniXNU-peridot.git unixnu
-          git clone --depth=1 https://github.com/UniXNU/UniXNU-sm8550-common.git sm8550_common || true
-          git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/kernel_devicetree.git
-          git clone --depth=1 -b chenfeng-u-oss https://github.com/MiCode/vendor_qcom_proprietary_display-devicetree.git
+          git clone --recurse-submodules https://github.com/hoshikv/UniXNU-peridot.git unixnu
 
-      - name: Link Shared SoC Headers & Apply Hardware Overrides
+      - name: Set Up Linux XNU Toolchain (Logged Separately)
         run: |
           cd work/unixnu
           mkdir -p final-output
+          echo "Setting up Linux XNU toolchain..."
+          sudo python3 scripts/linux/setup-toolchain.py > final-output/toolchain.log 2>&1 || {
+            echo "Toolchain setup failed! Last 50 lines:" >> final-output/build.log
+            tail -n 50 final-output/toolchain.log >> final-output/build.log
+            exit 1
+          }
+          echo "Toolchain setup succeeded." >> final-output/build.log
 
-          # 1. Copy required SM8550 headers into dts/ include path (DO NOT compile .dtsi directly!)
-          if [ -d "../sm8550_common/dts" ]; then
-            cp -f ../sm8550_common/dts/*.dtsi dts/ 2>/dev/null || true
-            cp -f ../sm8550_common/dts/*.h dts/ 2>/dev/null || true
-          fi
-
-          if [ -d "../kernel_devicetree/qcom" ]; then
-            cp -f ../kernel_devicetree/qcom/*.dtsi dts/ 2>/dev/null || true
-            cp -f ../kernel_devicetree/qcom/*.h dts/ 2>/dev/null || true
-          fi
-
-          if [ ! -f "dts/sm8550.dtsi" ]; then
-            curl -s https://raw.githubusercontent.com/MiCode/kernel_devicetree/chenfeng-u-oss/qcom/sm8550.dtsi -o dts/sm8550.dtsi || true
-          fi
-
-          # 2. Create chenfeng.dts from peridot.dts
-          cp dts/peridot.dts dts/chenfeng.dts
-          sed -i 's/peridot/chenfeng/g; s/Poco F6 \/ Redmi Turbo 3/Xiaomi 14 Civi/g' dts/chenfeng.dts
-
-          # 3. Update board.toml for chenfeng
-          sed -i 's/name = "peridot"/name = "chenfeng"/g' board.toml
-          sed -i 's/description = "Xiaomi Poco F6 \/ Redmi Turbo 3"/description = "Xiaomi 14 Civi (chenfeng)"/g' board.toml
-          sed -i 's/defconfig = "peridot_defconfig"/defconfig = "chenfeng_defconfig"/g' board.toml
-          sed -i 's/source = "device:dts\/peridot.dts"/source = "device:dts\/chenfeng.dts"/g' board.toml
-          sed -i 's/model = "xiaomi,peridot"/model = "xiaomi,chenfeng"/g' board.toml
-
-          # 4. Patch TouchBoard.h for 1236x2750 scaling
+      - name: Patch Hardware Values for Xiaomi 14 Civi (chenfeng)
+        run: |
+          cd work/unixnu
+          
+          # 1. Patch TouchBoard.h for Xiaomi 14 Civi 1236x2750 display (19776 x 44000 in 1/16th pixel units)
           sed -i 's/#define TB_TOUCH_MAX_X   19520/#define TB_TOUCH_MAX_X   19776/g' kits/peridot/TouchBoard.h
           sed -i 's/#define TB_TOUCH_MAX_Y   43400/#define TB_TOUCH_MAX_Y   44000/g' kits/peridot/TouchBoard.h
 
-          # 5. Create defconfigs
-          cp configs/peridot_defconfig configs/chenfeng_defconfig
-          cp configs/peridot-gpu_defconfig configs/chenfeng-gpu_defconfig
+          # 2. Update model description in peridot.dts while keeping internal build target paths intact
+          sed -i 's/Xiaomi Poco F6 \/ Redmi Turbo 3/Xiaomi 14 Civi (chenfeng)/g' dts/peridot.dts
 
-          # 6. Compile ONLY the top-level device tree (chenfeng.dts)
-          dtc -I dts -O dtb -i dts -o final-output/chenfeng.dtb dts/chenfeng.dts 2>&1 | tee -a final-output/build.log
-
-      - name: Set Up Linux XNU Toolchain & Compile Kernel
-        run: |
-          cd work/unixnu
-          {
-            if [ -f scripts/linux/setup-toolchain.py ]; then
-              sudo python3 scripts/linux/setup-toolchain.py
-            fi
-
-            export JOBS=$(nproc)
-            export UNIXNU_XNU_ARCH=arm64
-
-            if [ -x ./unixnu ]; then
-              ./unixnu defconfig chenfeng_defconfig -D .
-              ./unixnu fetch || true
-              ./unixnu status --json || true
-              ./unixnu build package || true
-              ./unixnu build kernel || true
-            else
-              bash scripts/build-unixnu.sh || true
-              XNU_BOOTSTRAP=1 bash scripts/build-xnu-4k-baseline.sh || true
-            fi
-          } 2>&1 | tee -a final-output/build.log || true
-
-      - name: Collect Compiled Outputs & Logs
-        run: |
-          cd work/unixnu
-          cp board.toml final-output/
-          cp dts/chenfeng.dts final-output/
           cp kits/peridot/TouchBoard.h final-output/
-          find build out -type f \( -name "*.efi" -o -name "*.macho" -o -name "*.unstripped" -o -name "*.img" -o -name "*.fd" -o -name "*.dtb" -o -name "*.json" \) -exec cp --parents {} final-output/ \; 2>/dev/null || true
-          ls -lhR final-output/ | tee -a final-output/build.log
+          cp dts/peridot.dts final-output/chenfeng.dts
+          cp board.toml final-output/
 
-      - name: Upload Build Output & Full Log
+      - name: Fetch Feeds, Build DTB, Package & Kernel
+        run: |
+          cd work/unixnu
+          export JOBS=$(nproc)
+          export PATH="/opt/unixnu-linux/CommandLineTools/usr/bin:/opt/unixnu-linux/llvm/bin:$PATH"
+          {
+            echo "=== 1. Running unixnu defconfig ==="
+            ./unixnu defconfig peridot_defconfig -D .
+
+            echo "=== 2. Running unixnu fetch ==="
+            ./unixnu fetch
+
+            echo "=== 3. Running unixnu status ==="
+            ./unixnu status
+
+            echo "=== 4. Assembling build tree ==="
+            ./unixnu tree || true
+
+            echo "=== 5. Compiling chenfeng.dtb with fetched sm8550.dtsi ==="
+            SOC_DTS_DIR=$(find out -type f -name "sm8550.dtsi" -printf "%h\n" | head -n 1)
+            echo "Found sm8550.dtsi in: $SOC_DTS_DIR"
+            if [ -n "$SOC_DTS_DIR" ]; then
+              dtc -I dts -O dtb -i "$SOC_DTS_DIR" -i dts -o final-output/chenfeng.dtb dts/peridot.dts
+              echo "Compiled final-output/chenfeng.dtb successfully!"
+            fi
+
+            echo "=== 6. Building UEFI Package (UniXNU.efi) ==="
+            ./unixnu build package || true
+
+            echo "=== 7. Building XNU Kernel ==="
+            ./unixnu build kernel || true
+
+          } 2>&1 | tee -a final-output/build.log
+
+      - name: Collect Outputs
+        run: |
+          cd work/unixnu
+          find build out -type f \( -name "*.efi" -o -name "*.macho" -o -name "*.unstripped" -o -name "*.img" -o -name "*.fd" -o -name "*.dtb" -o -name "*.json" -o -name "*.log" \) -exec cp --parents {} final-output/ \; 2>/dev/null || true
+          echo "=== Final Collected Files ===" >> final-output/build.log
+          ls -lhR final-output/ >> final-output/build.log
+
+      - name: Upload Clean Build Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: boot-chenfeng-artifacts
