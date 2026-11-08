@@ -7,15 +7,15 @@ jobs:
   compile-chenfeng-os:
     runs-on: ubuntu-24.04
     steps:
-      - name: Install Host Dependencies
+      - name: Install Host & Shader Compiler Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y git patch flex bison byacc bzip2 cpio rsync curl wget \
             ca-certificates tcsh unifdef cmake meson clang lld llvm mtools build-essential \
             gcc-multilib pkg-config ninja-build python3 python3-dev python3-pip \
-            python3-venv python3-mako python3-yaml xz-utils libssl-dev zlib1g-dev \
-            libbsd-dev uuid-dev llvm-dev libclang-dev device-tree-compiler bc jq \
-            unzip zip gawk mawk
+            python3-venv python3-mako python3-yaml python3-packaging xz-utils libssl-dev \
+            zlib1g-dev libbsd-dev uuid-dev llvm-dev libclang-dev libexpat1-dev libdrm-dev \
+            glslang-tools spirv-tools zstd lz4 device-tree-compiler bc jq unzip zip gawk mawk
           sudo mkdir -p /opt/unixnu-linux
           sudo chown -R runner:runner /opt/unixnu-linux
 
@@ -34,6 +34,9 @@ jobs:
           mkdir -p work && cd work
           git clone --recurse-submodules https://github.com/hoshikv/UniXNU-peridot.git unixnu
           git clone --depth=1 https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
+          if [ -f unixnu/scripts/requirements-adreno-compiler.txt ]; then
+            pip3 install --break-system-packages -r unixnu/scripts/requirements-adreno-compiler.txt || true
+          fi
 
       - name: Set Up Linux XNU Toolchain
         run: |
@@ -60,31 +63,31 @@ jobs:
           fi
           sudo chown -R runner:runner /opt/unixnu-linux
 
-      - name: Install clang-24, llvm-objcopy, brew & __ptrauth Wrappers
+      - name: Install & Self-Test clang-24, llvm-objcopy, brew & Source Patches
         shell: python3 {0}
         run: |
-          import glob, os, pathlib, shutil, subprocess, textwrap
+          import glob, os, pathlib, shutil, subprocess
 
-          # 1. Install /usr/local/bin/brew shim so `brew --prefix llvm` returns /opt/unixnu-linux/llvm
-          brew_shim = textwrap.dedent('''\
-              #!/usr/bin/env python3
-              import sys
-              args = sys.argv[1:]
-              if "--prefix" in args:
-                  if "llvm" in args or "lld" in args:
-                      print("/opt/unixnu-linux/llvm")
-                  else:
-                      print("/usr")
-                  sys.exit(0)
-              print("/usr")
-          ''')
+          # 1. Create /usr/local/bin/brew shim for macOS scripts calling `brew --prefix`
+          brew_lines = [
+              "#!/usr/bin/env python3",
+              "import sys",
+              "args = sys.argv[1:]",
+              "if '--prefix' in args:",
+              "    if any(k in args for k in ('llvm', 'lld', 'clang')):",
+              "        print('/opt/unixnu-linux/llvm')",
+              "    else:",
+              "        print('/usr')",
+              "    sys.exit(0)",
+              "print('/usr')",
+          ]
           tmp_brew = pathlib.Path("/tmp/brew-shim")
-          tmp_brew.write_text(brew_shim)
+          tmp_brew.write_text("\n".join(brew_lines) + "\n")
           tmp_brew.chmod(0o755)
           subprocess.run(["sudo", "cp", "-f", "/tmp/brew-shim", "/usr/local/bin/brew"], check=True)
           subprocess.run(["sudo", "cp", "-f", "/tmp/brew-shim", "/usr/bin/brew"], check=True)
 
-          # 2. Symlink host llvm-* tools into /opt/unixnu-linux/llvm/bin if missing
+          # 2. Populate /opt/unixnu-linux/llvm/bin with all host LLVM binutils
           llvm_bin = pathlib.Path("/opt/unixnu-linux/llvm/bin")
           for tool in glob.glob("/usr/bin/llvm-*") + glob.glob("/usr/bin/lld*") + glob.glob("/usr/bin/ld.lld*"):
               tname = os.path.basename(tool)
@@ -98,173 +101,163 @@ jobs:
           if not clang_real.exists():
               shutil.move(str(clang_path), str(clang_real))
 
-          clang_wrapper = textwrap.dedent('''\
-              #!/usr/bin/env python3
-              import os, re, sys
-              real = "/opt/unixnu-linux/llvm/bin/clang-24.real"
-              args = sys.argv[1:]
-              if not args or args[0] not in ("-cc1", "-cc1as"):
-                  ver = "27.0"
-                  for a in args:
-                      if a.startswith(("-mios-version-min=", "-miphoneos-version-min=")):
-                          ver = a.split("=", 1)[1]
-                  if any("apple-ios" in a for a in args):
-                      new_args = []
-                      for a in args:
-                          if a.startswith(("-mios-version-min=", "-miphoneos-version-min=")):
-                              continue
-                          if "apple-ios" in a:
-                              a = re.sub(r"(apple-ios)[0-9.]+", rf"\\g<1>{ver}", a)
-                          new_args.append(a)
-                      args = new_args
-                  args.extend(["-Wno-overriding-option", "-Wno-error=overriding-option"])
-              os.execv(real, [real] + args)
-          ''')
-          clang_path.write_text(clang_wrapper)
+          clang_lines = [
+              "#!/usr/bin/env python3",
+              "import os, re, sys",
+              "real = '/opt/unixnu-linux/llvm/bin/clang-24.real'",
+              "args = sys.argv[1:]",
+              "if not args or args[0] not in ('-cc1', '-cc1as'):",
+              "    ver = '27.0'",
+              "    for a in args:",
+              "        if a.startswith(('-mios-version-min=', '-miphoneos-version-min=')):",
+              "            ver = a.split('=', 1)[1]",
+              "    if any('apple-ios' in a for a in args):",
+              "        new_args = []",
+              "        for a in args:",
+              "            if a.startswith(('-mios-version-min=', '-miphoneos-version-min=')):",
+              "                continue",
+              "            if 'apple-ios' in a:",
+              "                a = re.sub(r'apple-ios[0-9.]+', 'apple-ios' + ver, a)",
+              "            new_args.append(a)",
+              "        args = new_args",
+              "    args.extend(['-Wno-overriding-option', '-Wno-error=overriding-option'])",
+              "os.execv(real, [real] + args)",
+          ]
+          clang_path.write_text("\n".join(clang_lines) + "\n")
           clang_path.chmod(0o755)
 
-          # 4. Wrap llvm-objcopy to support --globalize-symbol, --localize-symbol, and --redefine-sym on Mach-O
-          objcopy_wrapper = textwrap.dedent('''\
-              #!/usr/bin/env python3
-              import os, shutil, struct, subprocess, sys
-
-              real = "/usr/bin/llvm-objcopy.real"
-              args = sys.argv[1:]
-              globalize = []
-              localize = []
-              redefine = {}
-              pass_args = []
-              i = 0
-              while i < len(args):
-                  a = args[i]
-                  if a.startswith("--globalize-symbol="):
-                      globalize.append(a.split("=", 1)[1])
-                  elif a == "--globalize-symbol" and i + 1 < len(args):
-                      globalize.append(args[i + 1])
-                      i += 1
-                  elif a.startswith("--localize-symbol="):
-                      localize.append(a.split("=", 1)[1])
-                  elif a == "--localize-symbol" and i + 1 < len(args):
-                      localize.append(args[i + 1])
-                      i += 1
-                  elif a.startswith("--redefine-sym="):
-                      k, v = a.split("=", 1)[1].split("=", 1)
-                      redefine[k] = v
-                  elif a == "--redefine-sym" and i + 1 < len(args):
-                      k, v = args[i + 1].split("=", 1)
-                      redefine[k] = v
-                      i += 1
-                  else:
-                      pass_args.append(a)
-                  i += 1
-
-              if not globalize and not localize and not redefine:
-                  os.execv(real, [real] + args)
-
-              pos = [a for a in pass_args if not a.startswith("-")]
-              opt = [a for a in pass_args if a.startswith("-")]
-              in_file = pos[0]
-              out_file = pos[1] if len(pos) > 1 else in_file
-
-              if opt:
-                  res = subprocess.run([real] + pass_args)
-                  if res.returncode != 0:
-                      sys.exit(res.returncode)
-              elif in_file != out_file:
-                  shutil.copyfile(in_file, out_file)
-
-              data = bytearray(open(out_file, "rb").read())
-              if len(data) >= 32 and struct.unpack_from("<I", data, 0)[0] == 0xFEEDFACF:
-                  ncmds = struct.unpack_from("<I", data, 16)[0]
-                  off = 32
-                  symtab_off = dysym_off = None
-                  segs = []
-                  for _ in range(ncmds):
-                      cmd, cmdsize = struct.unpack_from("<II", data, off)
-                      if cmd == 0x2:
-                          symtab_off = off
-                      elif cmd == 0xB:
-                          dysym_off = off
-                      elif cmd == 0x19:
-                          segs.append(off)
-                      off += cmdsize
-
-                  if symtab_off is not None:
-                      _, _, symoff, nsyms, stroff, strsize = struct.unpack_from("<6I", data, symtab_off)
-                      g_targets = set()
-                      for g in globalize:
-                          g_targets.update([g, "_" + g, g.lstrip("_")])
-                      l_targets = set()
-                      for l in localize:
-                          l_targets.update([l, "_" + l, l.lstrip("_")])
-                      r_map = {}
-                      for k, v in redefine.items():
-                          r_map[k] = v
-                          if not k.startswith("_") and not v.startswith("_"):
-                              r_map["_" + k] = "_" + v
-
-                      syms = []
-                      for idx in range(nsyms):
-                          s_pos = symoff + idx * 16
-                          n_strx, n_type, n_sect, n_desc, n_value = struct.unpack_from("<IBBHQ", data, s_pos)
-                          end = data.find(0, stroff + n_strx)
-                          name = data[stroff + n_strx : end].decode("utf-8", "ignore") if end != -1 else ""
-                          if name in r_map:
-                              new_name = r_map[name]
-                              if stroff + strsize == len(data):
-                                  n_strx = strsize
-                                  enc = new_name.encode("utf-8") + bytes([0])
-                                  data.extend(enc)
-                                  strsize += len(enc)
-                                  struct.pack_into("<I", data, symtab_off + 20, strsize)
-                                  name = new_name
-                          if name in g_targets or name.lstrip("_") in g_targets:
-                              n_type = (n_type | 0x01) & ~0x10
-                          if name in l_targets or name.lstrip("_") in l_targets:
-                              n_type = n_type & ~0x01
-                          syms.append((idx, [n_strx, n_type, n_sect, n_desc, n_value], name))
-
-                      if dysym_off is not None:
-                          loc = [s for s in syms if (s[1][1] & 0x01) == 0]
-                          ext = [s for s in syms if (s[1][1] & 0x01) != 0 and (s[1][1] & 0x0E) != 0]
-                          und = [s for s in syms if (s[1][1] & 0x01) != 0 and (s[1][1] & 0x0E) == 0]
-                          ext.sort(key=lambda x: x[2])
-                          new_syms = loc + ext + und
-                          old_to_new = {orig_i: new_i for new_i, (orig_i, _, _) in enumerate(new_syms)}
-
-                          for new_i, (_, fields, _) in enumerate(new_syms):
-                              struct.pack_into("<IBBHQ", data, symoff + new_i * 16, *fields)
-
-                          struct.pack_into("<6I", data, dysym_off + 8, 0, len(loc), len(loc), len(ext), len(loc) + len(ext), len(und))
-
-                          for seg_off in segs:
-                              nsects = struct.unpack_from("<I", data, seg_off + 64)[0]
-                              for s_i in range(nsects):
-                                  sect_off = seg_off + 72 + s_i * 80
-                                  reloff, nreloc = struct.unpack_from("<II", data, sect_off + 56)
-                                  for r_i in range(nreloc):
-                                      r_pos = reloff + r_i * 8
-                                      r_info = struct.unpack_from("<I", data, r_pos + 4)[0]
-                                      if (r_info >> 27) & 1:
-                                          snum = r_info & 0x00FFFFFF
-                                          if snum in old_to_new:
-                                              r_info = (r_info & 0xFF000000) | (old_to_new[snum] & 0x00FFFFFF)
-                                              struct.pack_into("<I", data, r_pos + 4, r_info)
-
-                          indsymoff, nindsyms = struct.unpack_from("<II", data, dysym_off + 56)
-                          for k in range(nindsyms):
-                              ipos = indsymoff + k * 4
-                              val = struct.unpack_from("<I", data, ipos)[0]
-                              if (val & 0xC0000000) == 0 and val in old_to_new:
-                                  struct.pack_into("<I", data, ipos, old_to_new[val])
-                      else:
-                          for idx, (_, fields, _) in enumerate(syms):
-                              struct.pack_into("<IBBHQ", data, symoff + idx * 16, *fields)
-
-                  open(out_file, "wb").write(data)
-          ''')
+          # 4. Wrap llvm-objcopy for Mach-O symbol flags (--globalize-symbol, --localize-symbol, --weaken-symbol, --keep-global-symbol, --redefine-sym)
+          objcopy_lines = [
+              "#!/usr/bin/env python3",
+              "import os, shutil, struct, subprocess, sys",
+              "real = '/usr/bin/llvm-objcopy.real'",
+              "args = sys.argv[1:]",
+              "globalize, localize, weaken, keep_global = [], [], [], []",
+              "redefine = {}",
+              "pass_args = []",
+              "i = 0",
+              "while i < len(args):",
+              "    a = args[i]",
+              "    if a.startswith('--globalize-symbol='):",
+              "        globalize.append(a.split('=', 1)[1])",
+              "    elif a == '--globalize-symbol' and i + 1 < len(args):",
+              "        globalize.append(args[i + 1]); i += 1",
+              "    elif a.startswith('--localize-symbol='):",
+              "        localize.append(a.split('=', 1)[1])",
+              "    elif a in ('--localize-symbol', '-L') and i + 1 < len(args):",
+              "        localize.append(args[i + 1]); i += 1",
+              "    elif a.startswith('--weaken-symbol='):",
+              "        weaken.append(a.split('=', 1)[1])",
+              "    elif a in ('--weaken-symbol', '-W') and i + 1 < len(args):",
+              "        weaken.append(args[i + 1]); i += 1",
+              "    elif a.startswith('--keep-global-symbol='):",
+              "        keep_global.append(a.split('=', 1)[1])",
+              "    elif a in ('--keep-global-symbol', '-G') and i + 1 < len(args):",
+              "        keep_global.append(args[i + 1]); i += 1",
+              "    elif a.startswith('--redefine-sym='):",
+              "        k, v = a.split('=', 1)[1].split('=', 1); redefine[k] = v",
+              "    elif a == '--redefine-sym' and i + 1 < len(args):",
+              "        k, v = args[i + 1].split('=', 1); redefine[k] = v; i += 1",
+              "    else:",
+              "        pass_args.append(a)",
+              "    i += 1",
+              "if not any([globalize, localize, weaken, keep_global, redefine]):",
+              "    os.execv(real, [real] + args)",
+              "pos = [a for a in pass_args if not a.startswith('-')]",
+              "opt = [a for a in pass_args if a.startswith('-')]",
+              "in_file = pos[0]",
+              "out_file = pos[1] if len(pos) > 1 else in_file",
+              "if opt:",
+              "    res = subprocess.run([real] + pass_args)",
+              "    if res.returncode != 0: sys.exit(res.returncode)",
+              "elif in_file != out_file:",
+              "    shutil.copyfile(in_file, out_file)",
+              "data = bytearray(open(out_file, 'rb').read())",
+              "if len(data) >= 32 and struct.unpack_from('<I', data, 0)[0] == 0xFEEDFACF:",
+              "    ncmds = struct.unpack_from('<I', data, 16)[0]",
+              "    off = 32",
+              "    symtab_off = dysym_off = None",
+              "    segs = []",
+              "    for _ in range(ncmds):",
+              "        cmd, cmdsize = struct.unpack_from('<II', data, off)",
+              "        if cmd == 0x2: symtab_off = off",
+              "        elif cmd == 0xB: dysym_off = off",
+              "        elif cmd == 0x19: segs.append(off)",
+              "        off += cmdsize",
+              "    if symtab_off is not None:",
+              "        _, _, symoff, nsyms, stroff, strsize = struct.unpack_from('<6I', data, symtab_off)",
+              "        def expand_set(items):",
+              "            s = set()",
+              "            for x in items: s.update([x, '_' + x, x.lstrip('_')])",
+              "            return s",
+              "        g_set, l_set, w_set, kg_set = expand_set(globalize), expand_set(localize), expand_set(weaken), expand_set(keep_global)",
+              "        r_map = {}",
+              "        for k, v in redefine.items():",
+              "            r_map[k] = v",
+              "            if not k.startswith('_') and not v.startswith('_'): r_map['_' + k] = '_' + v",
+              "        if r_map and stroff + strsize < len(data):",
+              "            data.extend(data[stroff : stroff + strsize])",
+              "            stroff = len(data) - strsize",
+              "            struct.pack_into('<I', data, symtab_off + 16, stroff)",
+              "        syms = []",
+              "        for idx in range(nsyms):",
+              "            s_pos = symoff + idx * 16",
+              "            n_strx, n_type, n_sect, n_desc, n_value = struct.unpack_from('<IBBHQ', data, s_pos)",
+              "            end = data.find(0, stroff + n_strx)",
+              "            name = data[stroff + n_strx : end].decode('utf-8', 'ignore') if end != -1 else ''",
+              "            if name in r_map:",
+              "                new_name = r_map[name]",
+              "                n_strx = strsize",
+              "                enc = new_name.encode('utf-8') + bytes([0])",
+              "                data.extend(enc)",
+              "                strsize += len(enc)",
+              "                struct.pack_into('<I', data, symtab_off + 20, strsize)",
+              "                name = new_name",
+              "            if kg_set and (n_type & 0x0E) != 0 and name not in kg_set and name.lstrip('_') not in kg_set:",
+              "                n_type = n_type & ~0x01",
+              "            if name in g_set or name.lstrip('_') in g_set:",
+              "                n_type = (n_type | 0x01) & ~0x10",
+              "            if name in l_set or name.lstrip('_') in l_set:",
+              "                n_type = n_type & ~0x01",
+              "            if name in w_set or name.lstrip('_') in w_set:",
+              "                n_desc = n_desc | 0x0080",
+              "            syms.append((idx, [n_strx, n_type, n_sect, n_desc, n_value], name))",
+              "        if dysym_off is not None:",
+              "            loc = [s for s in syms if (s[1][1] & 0x01) == 0]",
+              "            ext = [s for s in syms if (s[1][1] & 0x01) != 0 and (s[1][1] & 0x0E) != 0]",
+              "            und = [s for s in syms if (s[1][1] & 0x01) != 0 and (s[1][1] & 0x0E) == 0]",
+              "            ext.sort(key=lambda x: x[2])",
+              "            new_syms = loc + ext + und",
+              "            old_to_new = {orig_i: new_i for new_i, (orig_i, _, _) in enumerate(new_syms)}",
+              "            for new_i, (_, fields, _) in enumerate(new_syms):",
+              "                struct.pack_into('<IBBHQ', data, symoff + new_i * 16, *fields)",
+              "            struct.pack_into('<6I', data, dysym_off + 8, 0, len(loc), len(loc), len(ext), len(loc) + len(ext), len(und))",
+              "            for seg_off in segs:",
+              "                nsects = struct.unpack_from('<I', data, seg_off + 64)[0]",
+              "                for s_i in range(nsects):",
+              "                    sect_off = seg_off + 72 + s_i * 80",
+              "                    reloff, nreloc = struct.unpack_from('<II', data, sect_off + 56)",
+              "                    for r_i in range(nreloc):",
+              "                        r_pos = reloff + r_i * 8",
+              "                        r_info = struct.unpack_from('<I', data, r_pos + 4)[0]",
+              "                        if (r_info >> 27) & 1:",
+              "                            snum = r_info & 0x00FFFFFF",
+              "                            if snum in old_to_new:",
+              "                                r_info = (r_info & 0xFF000000) | (old_to_new[snum] & 0x00FFFFFF)",
+              "                                struct.pack_into('<I', data, r_pos + 4, r_info)",
+              "            indsymoff, nindsyms = struct.unpack_from('<II', data, dysym_off + 56)",
+              "            for k in range(nindsyms):",
+              "                ipos = indsymoff + k * 4",
+              "                val = struct.unpack_from('<I', data, ipos)[0]",
+              "                if (val & 0xC0000000) == 0 and val in old_to_new:",
+              "                    struct.pack_into('<I', data, ipos, old_to_new[val])",
+              "        else:",
+              "            for idx, (_, fields, _) in enumerate(syms):",
+              "                struct.pack_into('<IBBHQ', data, symoff + idx * 16, *fields)",
+              "    open(out_file, 'wb').write(data)",
+          ]
           tmp_objcopy = pathlib.Path("/tmp/llvm-objcopy-wrapper")
-          tmp_objcopy.write_text(objcopy_wrapper)
+          tmp_objcopy.write_text("\n".join(objcopy_lines) + "\n")
           tmp_objcopy.chmod(0o755)
           if not pathlib.Path("/usr/bin/llvm-objcopy.real").exists():
               real_bin = os.path.realpath("/usr/bin/llvm-objcopy")
@@ -275,7 +268,12 @@ jobs:
               (llvm_bin / "llvm-objcopy").unlink()
           subprocess.run(["sudo", "cp", "-f", "/tmp/llvm-objcopy-wrapper", str(llvm_bin / "llvm-objcopy")], check=True)
 
-          # 5. Patch TouchBoard.h, peridot.dts, and prepare-xnu-source.py
+          # 5. Self-test all wrappers right now before starting the build
+          subprocess.run(["/usr/local/bin/brew", "--prefix", "llvm"], check=True)
+          subprocess.run(["/usr/bin/llvm-objcopy", "--version"], check=True)
+          subprocess.run([str(clang_path), "--version"], check=True)
+
+          # 6. Patch TouchBoard.h, peridot.dts, and prepare-xnu-source.py
           repo = pathlib.Path("work/unixnu")
           tb = repo / "kits/peridot/TouchBoard.h"
           tb.write_text(tb.read_text().replace("#define TB_TOUCH_MAX_X   19520", "#define TB_TOUCH_MAX_X   19776").replace("#define TB_TOUCH_MAX_Y   43400", "#define TB_TOUCH_MAX_Y   44000"))
@@ -294,6 +292,7 @@ jobs:
         run: |
           cd work/unixnu
           export JOBS=$(nproc)
+          export PATH="$PATH:/opt/unixnu-linux/CommandLineTools/usr/bin"
           export C_INCLUDE_PATH=/usr/include/x86_64-linux-gnu
           export CPLUS_INCLUDE_PATH=/usr/include/x86_64-linux-gnu
           {
@@ -346,4 +345,3 @@ jobs:
         with:
           name: boot-chenfeng-artifacts
           path: work/unixnu/final-output/
-          
