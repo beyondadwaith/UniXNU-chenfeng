@@ -51,7 +51,10 @@ jobs:
             sudo python3 scripts/linux/setup-toolchain.py > final-output/toolchain.log 2>&1
             sudo mkdir -p /opt/unixnu-linux/usr-local-bin
             sudo cp -af /usr/local/bin/* /opt/unixnu-linux/usr-local-bin/ 2>/dev/null || true
-            sudo cp -f /usr/local/bin/xcrun /opt/unixnu-linux/xcrun.cached 2>/dev/null || true
+            XCRUN_PATH=$(command -v xcrun || true)
+            if [ -n "$XCRUN_PATH" ]; then
+              sudo cp -f "$XCRUN_PATH" /opt/unixnu-linux/xcrun.cached 2>/dev/null || true
+            fi
           else
             echo "Using cached /opt/unixnu-linux toolchain!" >> final-output/build.log
           fi
@@ -68,7 +71,7 @@ jobs:
               import sys
               args = sys.argv[1:]
               if "--prefix" in args:
-                  if "llvm" in args:
+                  if "llvm" in args or "lld" in args:
                       print("/opt/unixnu-linux/llvm")
                   else:
                       print("/usr")
@@ -86,7 +89,7 @@ jobs:
           for tool in glob.glob("/usr/bin/llvm-*") + glob.glob("/usr/bin/lld*") + glob.glob("/usr/bin/ld.lld*"):
               tname = os.path.basename(tool)
               dest = llvm_bin / tname
-              if not dest.exists():
+              if not dest.exists() and not dest.is_symlink():
                   os.symlink(tool, dest)
 
           # 3. Wrap clang-24 to normalize iOS deployment target to 27.0
@@ -210,7 +213,7 @@ jobs:
                               new_name = r_map[name]
                               if stroff + strsize == len(data):
                                   n_strx = strsize
-                                  enc = new_name.encode("utf-8") + b"\x00"
+                                  enc = new_name.encode("utf-8") + bytes([0])
                                   data.extend(enc)
                                   strsize += len(enc)
                                   struct.pack_into("<I", data, symtab_off + 20, strsize)
