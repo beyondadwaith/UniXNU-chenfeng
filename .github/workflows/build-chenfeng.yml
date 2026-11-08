@@ -38,7 +38,7 @@ jobs:
       - name: Patch Hardware Values, Warning Flags & Submodule Sources
         shell: python3 {0}
         run: |
-          import pathlib, shutil
+          import pathlib, py_compile, shutil
 
           repo = pathlib.Path("work/unixnu")
           out = repo / "final-output"
@@ -56,79 +56,60 @@ jobs:
           dts = repo / "dts/peridot.dts"
           dts.write_text(dts.read_text().replace("Xiaomi Poco F6 / Redmi Turbo 3", "Xiaomi 14 Civi (chenfeng)"))
 
-          # 3. Add HTTP retry loop + curl fallback and MakeInc.def warning cleanup to prepare-xnu-source.py
-          prep = repo / "scripts/prepare-xnu-source.py"
-          prep_txt = prep.read_text()
-          old_fetch = "with urllib.request.urlopen(request, timeout=30) as response:\n        return response.read()"
-          new_fetch = (
-              "import subprocess, time\n"
-              "    for attempt in range(8):\n"
-              "        try:\n"
-              "            with urllib.request.urlopen(request, timeout=45) as response:\n"
-              "                return response.read()\n"
-              "        except Exception as e:\n"
-              "            print(f'fetch retry {attempt + 1}/8 after error: {e}', flush=True)\n"
-              "            time.sleep(3 * (attempt + 1))\n"
-              "    return subprocess.check_output(['curl', '--retry', '5', '--retry-all-errors', '-fsSL', url])"
-          )
-          if old_fetch in prep_txt:
-              prep_txt = prep_txt.replace(old_fetch, new_fetch)
+          # 3. Strip unsupported Clang 21 warning flags from all .sh and .py scripts in repo and feeds
+          bad_flags = [
+              "-Wno-unnecessary-virtual-specifier",
+              "-Wno-nrvo",
+              "-Wno-unterminated-string-initialization",
+              "-Wno-uninitialized-const-pointer",
+              "-Wno-format-signedness",
+              "-Wno-bounds-safety-legacy-checks-enabled",
+          ]
+          for pattern in ("scripts/*.sh", "scripts/*.py", "out/feeds/*/scripts/*.sh", "out/feeds/*/scripts/*.py"):
+              for sf in repo.glob(pattern):
+                  txt = sf.read_text(errors="ignore")
+                  for bf in bad_flags:
+                      txt = txt.replace(bf, "-Wno-unknown-warning-option")
+                  if sf.suffix == ".py" and "'-Werror'" in txt and "'-Wno-error=unknown-warning-option'" not in txt:
+                      txt = txt.replace("'-Werror'", "'-Werror', '-Wno-unknown-warning-option', '-Wno-error=unknown-warning-option'")
+                  sf.write_text(txt)
 
-          prep_hook = """
-          import pathlib
-          for mk in pathlib.Path('.cache/xnu-work/makedefs').glob('MakeInc.*'):
-              t = mk.read_text(errors='ignore')
-              for bad in (
-                  '-Wno-unnecessary-virtual-specifier',
-                  '-Wno-nrvo',
-                  '-Wno-unterminated-string-initialization',
-                  '-Wno-uninitialized-const-pointer',
-                  '-Wno-format-signedness',
-                  '-Wno-bounds-safety-legacy-checks-enabled',
-              ):
-                  t = t.replace(bad, '-Wno-unknown-warning-option')
-              mk.write_text(t)
-          """
-          prep.write_text(prep_txt + "\n" + "\n".join(line[10:] for line in prep_hook.strip().splitlines()) + "\n")
+          # 4. Add HTTP retry + MakeInc.def cleanup to prepare-xnu-source.py (single-line, no string slicing)
+          for prep in list(repo.glob("scripts/prepare-xnu-source.py")) + list(repo.glob("out/feeds/*/scripts/prepare-xnu-source.py")):
+              ptxt = prep.read_text()
+              old_fetch = "with urllib.request.urlopen(request, timeout=30) as response:\n        return response.read()"
+              new_fetch = (
+                  "import subprocess, time\n"
+                  "    for attempt in range(8):\n"
+                  "        try:\n"
+                  "            with urllib.request.urlopen(request, timeout=45) as response:\n"
+                  "                return response.read()\n"
+                  "        except Exception as e:\n"
+                  "            print(f'fetch retry {attempt + 1}/8: {e}', flush=True)\n"
+                  "            time.sleep(3 * (attempt + 1))\n"
+                  "    return subprocess.check_output(['curl', '--retry', '5', '--retry-all-errors', '-fsSL', url])"
+              )
+              if old_fetch in ptxt:
+                  ptxt = ptxt.replace(old_fetch, new_fetch)
+              cleanup_line = (
+                  "\nimport pathlib; [mk.write_text("
+                  "mk.read_text(errors='ignore')"
+                  ".replace('-Wno-unnecessary-virtual-specifier', '')"
+                  ".replace('-Wno-nrvo', '')"
+                  ".replace('-Wno-unterminated-string-initialization', '')"
+                  ".replace('-Wno-uninitialized-const-pointer', '')"
+                  ".replace('-Wno-format-signedness', '')"
+                  ".replace('-Wno-bounds-safety-legacy-checks-enabled', '')"
+                  ") for mk in pathlib.Path('.cache/xnu-work/makedefs').glob('MakeInc.*')]\n"
+              )
+              prep.write_text(ptxt + cleanup_line)
+              py_compile.compile(str(prep), doraise=True)
 
-          # 4. Hook prepare-storage-headers.py to sanitize all generated .o.json / .cpo.json compile records
-          stor = repo / "scripts/prepare-storage-headers.py"
-          stor_hook = """
-          import json, pathlib
-          bad_flags = {
-              '-Wno-unnecessary-virtual-specifier',
-              '-Wno-nrvo',
-              '-Wno-unterminated-string-initialization',
-              '-Wno-uninitialized-const-pointer',
-              '-Wno-format-signedness',
-              '-Wno-bounds-safety-legacy-checks-enabled',
-          }
-          for jf in pathlib.Path('build/xnu/ios-obj').rglob('*.json'):
-              try:
-                  raw = jf.read_text(errors='ignore').strip()
-                  if raw.endswith(','):
-                      raw = raw[:-1]
-                  rec = json.loads(raw)
-                  if isinstance(rec, dict) and 'arguments' in rec:
-                      args = [a for a in rec['arguments'] if a not in bad_flags]
-                      args.extend(['-Wno-unknown-warning-option', '-Wno-error=unknown-warning-option'])
-                      rec['arguments'] = args
-                      jf.write_text(json.dumps(rec))
-              except Exception:
-                  pass
-          """
-          stor.write_text(stor.read_text() + "\n" + "\n".join(line[10:] for line in stor_hook.strip().splitlines()) + "\n")
+          # 5. Syntax-check all modified Python scripts
+          for pyf in list(repo.glob("scripts/*.py")) + list(repo.glob("out/feeds/*/scripts/*.py")):
+              py_compile.compile(str(pyf), doraise=True)
 
-          # 5. Ensure all driver build scripts in scripts/*.py pass -Wno-unknown-warning-option after -Werror
-          for pyf in (repo / "scripts").glob("*.py"):
-              if pyf.name in ("prepare-xnu-source.py", "prepare-storage-headers.py"):
-                  continue
-              ptxt = pyf.read_text(errors="ignore")
-              if "'-Werror'" in ptxt and "'-Wno-error=unknown-warning-option'" not in ptxt:
-                  ptxt = ptxt.replace("'-Werror'", "'-Werror', '-Wno-unknown-warning-option', '-Wno-error=unknown-warning-option'")
-                  pyf.write_text(ptxt)
-
-          # 6. Fix mKernelBase unused warning in DarwinBoot and commit inside submodule so git status stays clean
+          # 6. Fix mKernelBase unused warning in DarwinBoot (leave uncommitted so ./unixnu preserves local changes)
           for fb in repo.rglob("Fastboot.c"):
               txt = fb.read_text()
               txt = txt.replace("STATIC UINT64  mKernelBase;", "STATIC UINT64 __attribute__((unused)) mKernelBase;")
@@ -148,7 +129,6 @@ jobs:
         run: |
           cd work/unixnu
           export PATH="$(brew --prefix lld)/bin:$(brew --prefix llvm)/bin:$PATH"
-          git -C drivers/DarwinBoot commit -am "suppress mKernelBase warning" 2>/dev/null || true
           {
             echo "=== 3. Compiling Device Tree ==="
             ./unixnu tree
