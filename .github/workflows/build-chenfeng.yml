@@ -9,7 +9,7 @@ jobs:
     steps:
       - name: Install Host Dependencies via Homebrew
         run: |
-          brew install llvm lld dtc ninja cmake meson pkg-config mtools
+          brew install llvm lld dtc ninja cmake meson pkg-config mtools glslang spirv-tools
           pip3 install --break-system-packages mako pyyaml packaging || pip3 install mako pyyaml packaging || true
 
       - name: Clone UniXNU-peridot & Mu-Silicium UEFI
@@ -17,22 +17,64 @@ jobs:
           mkdir -p work && cd work
           git clone --recurse-submodules https://github.com/hoshikv/UniXNU-peridot.git unixnu
           git clone --depth=1 https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
+          if [ -f unixnu/scripts/requirements-adreno-compiler.txt ]; then
+            pip3 install --break-system-packages -r unixnu/scripts/requirements-adreno-compiler.txt || pip3 install -r unixnu/scripts/requirements-adreno-compiler.txt || true
+          fi
 
-      - name: Patch Hardware Values for Xiaomi 14 Civi
+      - name: Patch Hardware Values, HTTP Retries & DarwinBoot Warning
+        shell: python3 {0}
         run: |
-          cd work/unixnu
-          mkdir -p final-output
+          import pathlib, shutil
+
+          repo = pathlib.Path("work/unixnu")
+          out = repo / "final-output"
+          out.mkdir(parents=True, exist_ok=True)
 
           # 1. Patch TouchBoard.h for Xiaomi 14 Civi 1236x2750 display (19776 x 44000)
-          sed -i '' 's/#define TB_TOUCH_MAX_X   19520/#define TB_TOUCH_MAX_X   19776/g' kits/peridot/TouchBoard.h
-          sed -i '' 's/#define TB_TOUCH_MAX_Y   43400/#define TB_TOUCH_MAX_Y   44000/g' kits/peridot/TouchBoard.h
+          tb = repo / "kits/peridot/TouchBoard.h"
+          tb.write_text(
+              tb.read_text()
+              .replace("#define TB_TOUCH_MAX_X   19520", "#define TB_TOUCH_MAX_X   19776")
+              .replace("#define TB_TOUCH_MAX_Y   43400", "#define TB_TOUCH_MAX_Y   44000")
+          )
 
-          # 2. Update model string
-          sed -i '' 's/Xiaomi Poco F6 \/ Redmi Turbo 3/Xiaomi 14 Civi (chenfeng)/g' dts/peridot.dts
+          # 2. Update model string in peridot.dts
+          dts = repo / "dts/peridot.dts"
+          dts.write_text(dts.read_text().replace("Xiaomi Poco F6 / Redmi Turbo 3", "Xiaomi 14 Civi (chenfeng)"))
 
-          cp kits/peridot/TouchBoard.h final-output/
-          cp dts/peridot.dts final-output/chenfeng.dts
-          cp board.toml final-output/
+          # 3. Add retry loop + curl fallback to prepare-xnu-source.py so HTTP 504 never aborts the build
+          prep = repo / "scripts/prepare-xnu-source.py"
+          prep_txt = prep.read_text()
+          old_fetch = "with urllib.request.urlopen(request, timeout=30) as response:\n        return response.read()"
+          new_fetch = (
+              "import subprocess, time\n"
+              "    for attempt in range(8):\n"
+              "        try:\n"
+              "            with urllib.request.urlopen(request, timeout=45) as response:\n"
+              "                return response.read()\n"
+              "        except Exception as e:\n"
+              "            print(f'fetch retry {attempt + 1}/8 after error: {e}', flush=True)\n"
+              "            time.sleep(3 * (attempt + 1))\n"
+              "    return subprocess.check_output(['curl', '--retry', '5', '--retry-all-errors', '-fsSL', url])"
+          )
+          if old_fetch in prep_txt:
+              prep.write_text(prep_txt.replace(old_fetch, new_fetch))
+
+          # 4. Fix -Werror,-Wunused-but-set-global on mKernelBase in DarwinBoot Fastboot.c & DarwinBoot.inf
+          for fb in repo.rglob("Fastboot.c"):
+              txt = fb.read_text()
+              txt = txt.replace("STATIC UINT64  mKernelBase;", "STATIC UINT64 __attribute__((unused)) mKernelBase;")
+              fb.write_text(txt)
+
+          for inf in repo.rglob("DarwinBoot.inf"):
+              txt = inf.read_text()
+              if "-Wno-unused-but-set-global" not in txt:
+                  txt = txt.replace("-Wno-unused-const-variable", "-Wno-unused-const-variable -Wno-unused-but-set-global")
+                  inf.write_text(txt)
+
+          shutil.copyfile(tb, out / "TouchBoard.h")
+          shutil.copyfile(dts, out / "chenfeng.dts")
+          shutil.copyfile(repo / "board.toml", out / "board.toml")
 
       - name: Build UniXNU System (Kernel, Drivers, UEFI & Boot Image)
         run: |
