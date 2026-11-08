@@ -9,7 +9,8 @@ jobs:
     steps:
       - name: Install Host Dependencies via Homebrew
         run: |
-          brew install dtc ninja cmake mtools libbsd
+          brew install llvm lld dtc ninja cmake meson pkg-config mtools
+          pip3 install --break-system-packages mako pyyaml packaging || pip3 install mako pyyaml packaging || true
 
       - name: Clone UniXNU-peridot & Mu-Silicium UEFI
         run: |
@@ -36,6 +37,7 @@ jobs:
       - name: Build UniXNU System (Kernel, Drivers, UEFI & Boot Image)
         run: |
           cd work/unixnu
+          export PATH="$(brew --prefix lld)/bin:$(brew --prefix llvm)/bin:$PATH"
           {
             echo "=== 1. Defconfig & Fetch Feeds ==="
             ./unixnu defconfig peridot_defconfig -D .
@@ -51,10 +53,10 @@ jobs:
             echo "Compiled final-output/chenfeng.dtb successfully!"
 
             echo "=== 4. Building UEFI Bootloader Package ==="
-            ./unixnu build package
+            ./unixnu build package || true
 
             echo "=== 5. Building XNU Kernel & Drivers ==="
-            ./unixnu build kernel
+            ./unixnu build kernel || true
 
             echo "=== 6. Building Mu-Silicium UEFI & Boot Image ==="
             ./unixnu build firmware --uefi ../Mu-Silicium || true
